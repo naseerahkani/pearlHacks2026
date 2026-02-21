@@ -1,6 +1,12 @@
 """
 MeshSentinel - Offline-First P2P Community Safety Alert System
 Backend: Flask REST API + TCP Socket Server + UDP Auto-Discovery + Hop Graph
+
+Cross-verification model:
+  - devices_reached : set of device IDs that have *received* this alert
+  - cross_checks    : set of device IDs that have *re-broadcast* (relayed) this alert
+                      i.e. independently witnessed it and passed it on
+  - Trust is based on cross_checks count (independent verifications), not receipt count
 """
 
 import json
@@ -26,8 +32,8 @@ from flask_cors import CORS
 SOCKET_PORT        = 5555
 FLASK_PORT         = 5000
 DISCOVERY_PORT     = 5556
-DISCOVERY_INTERVAL = 3      # seconds between UDP announcements
-PEER_TIMEOUT       = 15     # seconds before auto-discovered peer expires
+DISCOVERY_INTERVAL = 3
+PEER_TIMEOUT       = 15
 
 MY_DEVICE_ID = f"DEVICE-{uuid.uuid4().hex[:8].upper()}"
 
@@ -36,12 +42,20 @@ MY_DEVICE_ID = f"DEVICE-{uuid.uuid4().hex[:8].upper()}"
 # ─────────────────────────────────────────────
 
 event_log: dict = {}
-# { event_id: { packet, confirmed_by:set, authorized_node, trust, relay_count, first_seen } }
+# { event_id: {
+#     packet           : original packet dict
+#     devices_reached  : set of device IDs that received this alert
+#     cross_checks     : set of device IDs that re-broadcast (verified) it
+#     authorized_node  : bool — any authorized node confirmed it
+#     trust            : "LOW" | "MEDIUM" | "HIGH"
+#     max_hop          : highest hop number seen
+#     first_seen       : unix timestamp
+# }}
 
 hop_log: dict = {}
 # { event_id: [ { from_device, to_device, hop, ts, from_ip, to_ip } ] }
 
-manual_peers: list    = []
+manual_peers:    list = []
 discovered_peers: dict = {}   # { ip: last_seen_timestamp }
 active_connections: list = []
 
@@ -116,11 +130,21 @@ def get_all_known_peers() -> list:
 # ─────────────────────────────────────────────
 
 def calculate_trust(event_id: str) -> str:
+    """
+    Trust is based solely on independent cross-checks:
+    how many *different* devices have re-broadcast this alert.
+    A single device broadcasting does not count as a cross-check.
+    """
     entry = event_log.get(event_id, {})
-    if entry.get("authorized_node"): return "HIGH"
-    count = len(entry.get("confirmed_by", set()))
-    if count >= 10: return "HIGH"
-    if count >= 3:  return "MEDIUM"
+    if entry.get("authorized_node"):
+        return "HIGH"
+    # cross_checks is a set of device IDs that relayed the alert
+    # exclude the original broadcaster from the cross-check count
+    original = entry.get("packet", {}).get("device_id", "")
+    checks = entry.get("cross_checks", set()) - {original}
+    count = len(checks)
+    if count >= 9:  return "HIGH"
+    if count >= 2:  return "MEDIUM"
     return "LOW"
 
 # ─────────────────────────────────────────────
@@ -129,11 +153,9 @@ def calculate_trust(event_id: str) -> str:
 
 def record_hop(event_id: str, from_device: str, to_device: str,
                hop_num: int, from_ip: str = "", to_ip: str = ""):
-    """Record one relay edge in the hop graph for this event."""
     with hop_lock:
         if event_id not in hop_log:
             hop_log[event_id] = []
-        # Deduplicate: skip if this exact from→to edge already recorded
         existing = [(h["from_device"], h["to_device"]) for h in hop_log[event_id]]
         if (from_device, to_device) not in existing:
             hop_log[event_id].append({
@@ -146,10 +168,23 @@ def record_hop(event_id: str, from_device: str, to_device: str,
             })
 
 # ─────────────────────────────────────────────
-# Packet Handling & Deduplication
+# Packet Handling
 # ─────────────────────────────────────────────
 
 def handle_packet(packet: dict, relay: bool = True, received_from_ip: str = ""):
+    """
+    Process an incoming alert packet.
+
+    devices_reached: every machine that receives a packet adds itself here.
+                     This is the "spread" metric — how far the alert has traveled.
+
+    cross_checks:    only machines that *re-broadcast* the alert add themselves here.
+                     This is the "verification" metric — independent witnesses who
+                     chose to propagate it, implicitly endorsing it as real.
+
+    The original broadcaster is in devices_reached but NOT in cross_checks
+    (you can't verify your own alert).
+    """
     eid = packet.get("event_id")
     if not eid:
         return
@@ -158,9 +193,10 @@ def handle_packet(packet: dict, relay: bool = True, received_from_ip: str = ""):
     hop_num       = packet.get("hop_count", 0)
     my_device     = MY_DEVICE_ID
     my_ip         = get_my_ips()[0] if get_my_ips() else ""
+    is_from_self  = (sender_device == my_device)
 
-    # Record the hop: whoever sent this → us
-    if received_from_ip or sender_device != my_device:
+    # Record relay graph edge: sender → this machine
+    if not is_from_self:
         record_hop(eid, sender_device, my_device, hop_num,
                    from_ip=received_from_ip, to_ip=my_ip)
 
@@ -169,31 +205,44 @@ def handle_packet(packet: dict, relay: bool = True, received_from_ip: str = ""):
         if is_new:
             event_log[eid] = {
                 "packet":          packet,
-                "confirmed_by":    set(),
+                "devices_reached": set(),
+                "cross_checks":    set(),
                 "authorized_node": bool(packet.get("is_authorized_node")),
                 "trust":           "LOW",
-                "relay_count":     0,
+                "max_hop":         0,
                 "first_seen":      time.time(),
             }
-            log.info(f"New event: {eid} type={packet.get('type')}")
-        else:
-            event_log[eid]["relay_count"] += 1
+            log.info(f"New event {eid[:8]}… type={packet.get('type')}")
 
-        confirming = set(packet.get("confirmed_by", []))
-        confirming.add(sender_device)
-        event_log[eid]["confirmed_by"].update(confirming)
+        entry = event_log[eid]
+
+        # This machine has now received the alert
+        entry["devices_reached"].add(my_device)
+
+        # The original sender also counts as reached
+        entry["devices_reached"].add(sender_device)
+
+        # Track max hop depth
+        entry["max_hop"] = max(entry["max_hop"], hop_num)
 
         if packet.get("is_authorized_node"):
-            event_log[eid]["authorized_node"] = True
+            entry["authorized_node"] = True
 
-        event_log[eid]["trust"] = calculate_trust(eid)
+        entry["trust"] = calculate_trust(eid)
 
-    if relay:
+    # Relay to peers — and if we're relaying, we count as a cross-check
+    if relay and not is_from_self:
+        peers = get_all_known_peers()
+        if peers:
+            # We are actively re-broadcasting → we are a cross-check
+            with event_lock:
+                event_log[eid]["cross_checks"].add(my_device)
+                event_log[eid]["trust"] = calculate_trust(eid)
+            log.info(f"Cross-check recorded: {my_device[:14]} verified event {eid[:8]}…")
+
         augmented = dict(packet)
-        augmented["hop_count"]    = hop_num + 1
-        augmented["device_id"]    = my_device          # we are now the relaying device
-        with event_lock:
-            augmented["confirmed_by"] = list(event_log[eid]["confirmed_by"])
+        augmented["hop_count"] = hop_num + 1
+        augmented["device_id"] = my_device
         relay_to_peers(augmented, origin_event_id=eid)
 
 # ─────────────────────────────────────────────
@@ -217,8 +266,8 @@ def handle_connection(conn, addr):
                 line = line.strip()
                 if line:
                     try:
-                        packet = json.loads(line.decode())
-                        handle_packet(packet, received_from_ip=peer_ip)
+                        pkt = json.loads(line.decode())
+                        handle_packet(pkt, received_from_ip=peer_ip)
                     except json.JSONDecodeError as e:
                         log.warning(f"Bad packet from {addr}: {e}")
     except Exception as e:
@@ -245,8 +294,7 @@ def start_socket_server():
 
 
 def relay_to_peers(packet: dict, origin_event_id: str = ""):
-    """Send packet to all known peers and record outgoing hop edges."""
-    data      = (json.dumps(packet) + "\n").encode()
+    data = (json.dumps(packet) + "\n").encode()
     my_device = MY_DEVICE_ID
     hop_num   = packet.get("hop_count", 0)
 
@@ -257,11 +305,12 @@ def relay_to_peers(packet: dict, origin_event_id: str = ""):
             s.connect((peer_ip, SOCKET_PORT))
             s.sendall(data)
             s.close()
-            # Record the outgoing edge: us → peer
-            # We don't know the peer's device_id here, so use IP as label
+            # Record outgoing graph edge
             if origin_event_id:
                 record_hop(origin_event_id, my_device, f"PEER@{peer_ip}",
-                           hop_num, from_ip=get_my_ips()[0] if get_my_ips() else "", to_ip=peer_ip)
+                           hop_num,
+                           from_ip=get_my_ips()[0] if get_my_ips() else "",
+                           to_ip=peer_ip)
         except Exception as e:
             log.debug(f"Could not reach peer {peer_ip}: {e}")
 
@@ -310,9 +359,6 @@ def start_discovery_listener():
     sock.settimeout(5)
     log.info(f"UDP listener on port {DISCOVERY_PORT}")
 
-    # ip → device_id mapping learned from announcements
-    ip_to_device: dict = {}
-
     while True:
         try:
             data, addr = sock.recvfrom(2048)
@@ -326,17 +372,11 @@ def start_discovery_listener():
                 meta = json.loads(data[len(DISCOVERY_MAGIC):].decode())
             except Exception:
                 continue
-
-            peer_device = meta.get("device_id", f"PEER@{peer_ip}")
-
             with discovery_lock:
                 is_new = peer_ip not in discovered_peers
                 discovered_peers[peer_ip] = time.time()
-                ip_to_device[peer_ip] = peer_device
-
             if is_new:
-                log.info(f"✅ Discovered peer: {peer_ip} [{peer_device}]")
-
+                log.info(f"✅ Discovered peer: {peer_ip} [{meta.get('device_id','?')}]")
         except socket.timeout:
             continue
         except Exception as e:
@@ -364,16 +404,22 @@ CORS(app)
 
 def serialize_event(eid: str) -> dict:
     entry = event_log[eid]
-    p = entry["packet"]
+    p     = entry["packet"]
+    original = p.get("device_id", "")
+    # cross_checks excludes the original broadcaster
+    verified_checks = entry["cross_checks"] - {original}
     return {
         "event_id":           eid,
         "type":               p.get("type", "UNKNOWN"),
         "timestamp":          p.get("timestamp", 0),
-        "device_id":          p.get("device_id", ""),
-        "hop_count":          p.get("hop_count", 0),
-        "confirmed_by_count": len(entry["confirmed_by"]),
-        "confirmed_by":       list(entry["confirmed_by"]),
-        "relay_count":        entry["relay_count"],
+        "origin_device":      original,
+        "max_hop":            entry["max_hop"],
+        # How many unique devices have received this alert
+        "devices_reached":    len(entry["devices_reached"]),
+        "devices_reached_ids": list(entry["devices_reached"]),
+        # How many devices independently re-broadcast it (verified it)
+        "cross_checks":       len(verified_checks),
+        "cross_check_ids":    list(verified_checks),
         "trust":              entry["trust"],
         "authorized_node":    entry["authorized_node"],
         "first_seen":         entry["first_seen"],
@@ -401,8 +447,6 @@ def broadcast():
         "timestamp":           data.get("timestamp", int(time.time())),
         "device_id":           data["device_id"],
         "hop_count":           0,
-        "verification_weight": 1,
-        "confirmed_by":        [data["device_id"]],
         "is_authorized_node":  data.get("is_authorized_node", False),
     }
     handle_packet(packet, relay=True)
@@ -458,103 +502,64 @@ def get_device():
 
 @app.route("/api/hops", methods=["GET"])
 def get_hops():
-    """
-    Return the hop/relay graph for all events (or a specific event_id).
-    Used by the real-time network graph dashboard.
-
-    Response shape:
-    {
-      "nodes": [ { "id": device_id, "label": short_label, "is_self": bool } ],
-      "edges": [ { "from": device_id, "to": device_id, "hop": int, "ts": float, "event_id": str } ],
-      "events": { event_id: { "type", "trust", "confirmed_by_count" } }
-    }
-    """
     filter_eid = request.args.get("event_id", None)
-
-    node_set = {}    # id → node info
-    edges    = []
-
-    my_ips = set(get_my_ips())
+    node_set   = {}
+    edges      = []
 
     def clean_label(device_id: str) -> str:
-        # Turn "DEVICE-AB12CD34" → "AB12CD34", "PEER@192.168.1.2" → "192.168.1.2"
-        if device_id.startswith("PEER@"):
-            return device_id[5:]
-        if device_id.startswith("DEVICE-"):
-            return device_id[7:]
+        if device_id.startswith("PEER@"):  return device_id[5:]
+        if device_id.startswith("DEVICE-"): return device_id[7:]
         return device_id[:10]
 
     with hop_lock:
-        items = [(filter_eid, hop_log[filter_eid])] if filter_eid and filter_eid in hop_log \
+        items = [(filter_eid, hop_log[filter_eid])] \
+                if filter_eid and filter_eid in hop_log \
                 else list(hop_log.items())
-
         for eid, hops in items:
             for h in hops:
-                fd = h["from_device"]
-                td = h["to_device"]
-
-                # Register nodes
+                fd, td = h["from_device"], h["to_device"]
                 for did in [fd, td]:
                     if did not in node_set:
-                        is_self = (did == MY_DEVICE_ID)
                         node_set[did] = {
                             "id":      did,
                             "label":   clean_label(did),
-                            "is_self": is_self,
-                            "ip":      h.get("from_ip", "") if did == fd else h.get("to_ip", ""),
+                            "is_self": did == MY_DEVICE_ID,
+                            "ip":      h.get("from_ip","") if did==fd else h.get("to_ip",""),
                         }
+                edges.append({"from": fd, "to": td, "hop": h["hop"], "ts": h["ts"], "event_id": eid})
 
-                edges.append({
-                    "from":     fd,
-                    "to":       td,
-                    "hop":      h["hop"],
-                    "ts":       h["ts"],
-                    "event_id": eid,
-                })
-
-    # Attach event metadata
     with event_lock:
         events_meta = {}
         for eid in hop_log:
             if eid in event_log:
                 e = event_log[eid]
+                original = e["packet"].get("device_id","")
+                verified = e["cross_checks"] - {original}
                 events_meta[eid] = {
-                    "type":               e["packet"].get("type", "UNKNOWN"),
-                    "trust":              e["trust"],
-                    "confirmed_by_count": len(e["confirmed_by"]),
+                    "type":            e["packet"].get("type","UNKNOWN"),
+                    "trust":           e["trust"],
+                    "devices_reached": len(e["devices_reached"]),
+                    "cross_checks":    len(verified),
                 }
 
-    # Also include all known peers as nodes even if no hops yet
     now = time.time()
     with discovery_lock:
         for ip, ts in discovered_peers.items():
             if now - ts < PEER_TIMEOUT:
-                fake_id = f"PEER@{ip}"
-                if fake_id not in node_set:
-                    node_set[fake_id] = {
-                        "id":      fake_id,
-                        "label":   ip,
-                        "is_self": False,
-                        "ip":      ip,
-                        "online":  True,
-                    }
+                fid = f"PEER@{ip}"
+                if fid not in node_set:
+                    node_set[fid] = {"id": fid, "label": ip, "is_self": False, "ip": ip, "online": True}
 
-    # Always include self
     if MY_DEVICE_ID not in node_set:
         my_ip = get_my_ips()[0] if get_my_ips() else ""
         node_set[MY_DEVICE_ID] = {
-            "id":      MY_DEVICE_ID,
-            "label":   MY_DEVICE_ID[7:] if MY_DEVICE_ID.startswith("DEVICE-") else MY_DEVICE_ID,
-            "is_self": True,
-            "ip":      my_ip,
+            "id": MY_DEVICE_ID,
+            "label": MY_DEVICE_ID[7:] if MY_DEVICE_ID.startswith("DEVICE-") else MY_DEVICE_ID,
+            "is_self": True, "ip": my_ip,
         }
 
-    return jsonify({
-        "nodes":      list(node_set.values()),
-        "edges":      edges,
-        "events":     events_meta,
-        "self_id":    MY_DEVICE_ID,
-    })
+    return jsonify({"nodes": list(node_set.values()), "edges": edges,
+                    "events": events_meta, "self_id": MY_DEVICE_ID})
 
 
 @app.route("/api/events/<event_id>/authorize", methods=["POST"])
