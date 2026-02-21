@@ -11,8 +11,8 @@ const POLL_INTERVAL = 2000
 
 function TabBar({ active, onChange }) {
   const tabs = [
-    { id: 'feed',  label: '📋 Live Alerts'    },
-    { id: 'graph', label: '🕸️ Network Graph'  },
+    { id: 'feed',  label: '📋 Live Alerts'   },
+    { id: 'graph', label: '🕸️ Network Graph' },
   ]
   return (
     <div style={styles.tabBar}>
@@ -20,10 +20,7 @@ function TabBar({ active, onChange }) {
         <button
           key={t.id}
           onClick={() => onChange(t.id)}
-          style={{
-            ...styles.tab,
-            ...(active === t.id ? styles.tabActive : {}),
-          }}
+          style={{ ...styles.tab, ...(active === t.id ? styles.tabActive : {}) }}
         >
           {t.label}
           {active === t.id && <div style={styles.tabUnderline} />}
@@ -34,18 +31,25 @@ function TabBar({ active, onChange }) {
 }
 
 function App() {
-  const [tab, setTab]             = useState('feed')
-  const [events, setEvents]       = useState([])
-  const [peers, setPeers]         = useState({ active_connections: 0, known_peers: [], device_id: '' })
-  const [toasts, setToasts]       = useState([])
+  const [tab, setTab]         = useState('feed')
+  const [events, setEvents]   = useState([])
+  const [peers, setPeers]     = useState({
+    active_connections: 0,
+    known_peers: [],
+    discovered_peers: [],
+    manual_peers: [],
+    device_id: '',
+    my_ips: [],
+  })
+  const [toasts, setToasts]           = useState([])
   const [showPeerMgr, setShowPeerMgr] = useState(false)
-  const deviceIdRef   = useRef(null)
-  const prevEventIds  = useRef(new Set())
+  const deviceIdRef  = useRef(null)
+  const prevEventIds = useRef(new Set())
 
   useEffect(() => {
     fetch('/api/device')
       .then(r => r.json())
-      .then(d => { deviceIdRef.current = d.device_id })
+      .then(d => { if (d && d.device_id) deviceIdRef.current = d.device_id })
       .catch(() => {
         deviceIdRef.current = 'DEVICE-' + Math.random().toString(36).slice(2, 10).toUpperCase()
       })
@@ -59,25 +63,29 @@ function App() {
 
   const pollEvents = useCallback(async () => {
     try {
-      const res  = await fetch('/api/events')
+      const res = await fetch('/api/events')
+      if (!res.ok) return
       const data = await res.json()
+      if (!Array.isArray(data)) return   // guard: reject if backend returns error object
       setEvents(data)
       const newIds = new Set(data.map(e => e.event_id))
       data.forEach(e => {
         if (!prevEventIds.current.has(e.event_id)) {
-          addToast(`🚨 New ${e.type} alert — Trust: ${e.trust}`, 'alert')
+          addToast(`🚨 New ${e.type || 'UNKNOWN'} alert — Trust: ${e.trust || 'LOW'}`, 'alert')
         }
       })
       prevEventIds.current = newIds
-    } catch {}
+    } catch { /* backend not reachable yet */ }
   }, [addToast])
 
   const pollPeers = useCallback(async () => {
     try {
-      const res  = await fetch('/api/peers')
+      const res = await fetch('/api/peers')
+      if (!res.ok) return
       const data = await res.json()
-      setPeers(data)
-    } catch {}
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return
+      setPeers(prev => ({ ...prev, ...data }))
+    } catch { /* ignore */ }
   }, [])
 
   useEffect(() => {
@@ -88,7 +96,7 @@ function App() {
     return () => { clearInterval(t1); clearInterval(t2) }
   }, [pollEvents, pollPeers])
 
-  const handleBroadcast = async (type, isAuthorized = false) => {
+  const handleBroadcast = async (type, isAuthorized = false, description = '', location = '') => {
     const deviceId = deviceIdRef.current || 'DEVICE-UNKNOWN'
     const payload  = {
       event_id:           crypto.randomUUID(),
@@ -96,6 +104,8 @@ function App() {
       device_id:          deviceId,
       timestamp:          Math.floor(Date.now() / 1000),
       is_authorized_node: isAuthorized,
+      description:        description || '',
+      location:           location    || '',
     }
     try {
       const res = await fetch('/api/broadcast', {
@@ -104,22 +114,21 @@ function App() {
         body:    JSON.stringify(payload),
       })
       if (res.ok) {
-        addToast(`✅ ${type} alert broadcast`, 'success')
-        // Auto-switch to graph tab so they immediately see propagation
+        addToast(`✅ ${type} alert broadcast to mesh`, 'success')
         setTab('graph')
         pollEvents()
       } else {
-        addToast('❌ Broadcast failed', 'error')
+        addToast('❌ Broadcast failed — is the backend running?', 'error')
       }
     } catch {
-      addToast('❌ Cannot reach backend', 'error')
+      addToast('❌ Cannot reach backend on port 5000', 'error')
     }
   }
 
   return (
     <div style={styles.root}>
       <Header
-        deviceId={peers.device_id}
+        deviceId={peers.device_id || ''}
         connectedPeers={peers.active_connections || 0}
         eventCount={events.length}
         onOpenPeerMgr={() => setShowPeerMgr(true)}
@@ -129,7 +138,6 @@ function App() {
         <main style={styles.main}>
           <TabBar active={tab} onChange={setTab} />
           <div style={styles.tabContent}>
-            {/* Both panels always mounted so graph keeps animating in background */}
             <div style={{ ...styles.panel, display: tab === 'feed'  ? 'flex' : 'none' }}>
               <EventFeed events={events} onRefresh={pollEvents} />
             </div>
@@ -138,7 +146,6 @@ function App() {
             </div>
           </div>
         </main>
-
         <aside style={styles.sidebar}>
           <Sidebar />
         </aside>
@@ -152,7 +159,8 @@ function App() {
           onClose={() => setShowPeerMgr(false)}
           onAddPeer={async (ip) => {
             await fetch('/api/peers', {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ ip }),
             })
             pollPeers()
@@ -178,40 +186,26 @@ const styles = {
     display: 'flex', flexDirection: 'column',
     height: '100vh', background: 'var(--bg-primary)', overflow: 'hidden',
   },
-  body: {
-    display: 'flex', flex: 1, overflow: 'hidden',
-  },
-  main: {
-    flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden',
-  },
+  body:    { display: 'flex', flex: 1, overflow: 'hidden' },
+  main:    { flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' },
   tabBar: {
-    display: 'flex', gap: '0',
-    borderBottom: '1px solid var(--border)',
-    background: 'var(--bg-secondary)',
-    flexShrink: 0, paddingLeft: '12px',
+    display: 'flex', borderBottom: '1px solid var(--border)',
+    background: 'var(--bg-secondary)', flexShrink: 0, paddingLeft: '12px',
   },
   tab: {
-    position: 'relative',
-    padding: '12px 20px',
+    position: 'relative', padding: '12px 20px',
     background: 'transparent', border: 'none',
     color: 'var(--text-muted)', fontSize: '13px', fontWeight: 600,
     cursor: 'pointer', fontFamily: 'var(--font)',
-    transition: 'color 0.15s ease',
-    letterSpacing: '-0.01em',
+    transition: 'color 0.15s ease', letterSpacing: '-0.01em',
   },
-  tabActive: {
-    color: 'var(--text-primary)',
-  },
+  tabActive:    { color: 'var(--text-primary)' },
   tabUnderline: {
     position: 'absolute', bottom: '-1px', left: '12px', right: '12px',
     height: '2px', background: 'var(--accent-blue)', borderRadius: '1px',
   },
-  tabContent: {
-    flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column',
-  },
-  panel: {
-    flex: 1, overflow: 'hidden', flexDirection: 'column',
-  },
+  tabContent: { flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' },
+  panel:      { flex: 1, overflow: 'hidden', flexDirection: 'column' },
   sidebar: {
     width: '280px', borderLeft: '1px solid var(--border)',
     overflow: 'hidden', display: 'flex', flexDirection: 'column',

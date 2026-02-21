@@ -175,28 +175,27 @@ def handle_packet(packet: dict, relay: bool = True, received_from_ip: str = ""):
     """
     Process an incoming alert packet.
 
-    devices_reached: every machine that receives a packet adds itself here.
-                     This is the "spread" metric — how far the alert has traveled.
+    relay=True  + received_from_ip=""  → originated here (UI broadcast button)
+                                          Always send to peers. Not a cross-check.
+    relay=True  + received_from_ip set → arrived via TCP from a peer.
+                                          Send to peers (mesh relay). IS a cross-check.
+    relay=False                         → internal only, no forwarding.
 
-    cross_checks:    only machines that *re-broadcast* the alert add themselves here.
-                     This is the "verification" metric — independent witnesses who
-                     chose to propagate it, implicitly endorsing it as real.
-
-    The original broadcaster is in devices_reached but NOT in cross_checks
-    (you can't verify your own alert).
+    devices_reached: every machine that receives the alert.  Measures spread.
+    cross_checks:    machines that re-broadcast it (excluding original sender). Measures trust.
     """
     eid = packet.get("event_id")
     if not eid:
         return
 
-    sender_device = packet.get("device_id", "UNKNOWN")
-    hop_num       = packet.get("hop_count", 0)
-    my_device     = MY_DEVICE_ID
-    my_ip         = get_my_ips()[0] if get_my_ips() else ""
-    is_from_self  = (sender_device == my_device)
+    sender_device   = packet.get("device_id", "UNKNOWN")
+    hop_num         = packet.get("hop_count", 0)
+    my_device       = MY_DEVICE_ID
+    my_ip           = get_my_ips()[0] if get_my_ips() else ""
+    from_peer       = bool(received_from_ip)   # True only when received over TCP from another machine
 
-    # Record relay graph edge: sender → this machine
-    if not is_from_self:
+    # Record relay graph edge: sender → this machine (only for incoming peer packets)
+    if from_peer:
         record_hop(eid, sender_device, my_device, hop_num,
                    from_ip=received_from_ip, to_ip=my_ip)
 
@@ -212,17 +211,18 @@ def handle_packet(packet: dict, relay: bool = True, received_from_ip: str = ""):
                 "max_hop":         0,
                 "first_seen":      time.time(),
             }
-            log.info(f"New event {eid[:8]}… type={packet.get('type')}")
+            log.info(f"New event {eid[:8]}… type={packet.get('type')} description='{packet.get('description','')}'")
+        else:
+            # Already seen this event_id — ignore duplicate relays to prevent loops
+            # but still update cross_checks if this is a new peer relaying it
+            if from_peer:
+                event_log[eid]["cross_checks"].add(sender_device)
+                event_log[eid]["trust"] = calculate_trust(eid)
+            return  # ← stop here, don't re-relay duplicates
 
         entry = event_log[eid]
-
-        # This machine has now received the alert
         entry["devices_reached"].add(my_device)
-
-        # The original sender also counts as reached
         entry["devices_reached"].add(sender_device)
-
-        # Track max hop depth
         entry["max_hop"] = max(entry["max_hop"], hop_num)
 
         if packet.get("is_authorized_node"):
@@ -230,15 +230,14 @@ def handle_packet(packet: dict, relay: bool = True, received_from_ip: str = ""):
 
         entry["trust"] = calculate_trust(eid)
 
-    # Relay to peers — and if we're relaying, we count as a cross-check
-    if relay and not is_from_self:
-        peers = get_all_known_peers()
-        if peers:
-            # We are actively re-broadcasting → we are a cross-check
+    # Relay outward to all known peers
+    if relay:
+        # If this packet came from a peer (not from our own UI), we are a cross-check
+        if from_peer:
             with event_lock:
                 event_log[eid]["cross_checks"].add(my_device)
                 event_log[eid]["trust"] = calculate_trust(eid)
-            log.info(f"Cross-check recorded: {my_device[:14]} verified event {eid[:8]}…")
+            log.info(f"✓ Cross-check: {my_device[-8:]} verified event {eid[:8]}…")
 
         augmented = dict(packet)
         augmented["hop_count"] = hop_num + 1
@@ -424,6 +423,8 @@ def serialize_event(eid: str) -> dict:
         "authorized_node":    entry["authorized_node"],
         "first_seen":         entry["first_seen"],
         "is_authorized_node": p.get("is_authorized_node", False),
+        "description":        p.get("description", ""),
+        "location":           p.get("location", ""),
     }
 
 
@@ -448,6 +449,8 @@ def broadcast():
         "device_id":           data["device_id"],
         "hop_count":           0,
         "is_authorized_node":  data.get("is_authorized_node", False),
+        "description":         data.get("description", "").strip()[:280],
+        "location":            data.get("location", "").strip()[:100],
     }
     handle_packet(packet, relay=True)
     return jsonify({"status": "ok", "event_id": packet["event_id"]})

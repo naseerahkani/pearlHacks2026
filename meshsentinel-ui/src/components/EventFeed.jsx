@@ -13,14 +13,13 @@ const TRUST_META = {
   LOW:    { color: 'var(--trust-low)',     bg: 'var(--trust-low-bg)',    border: 'var(--trust-low-border)'    },
 }
 
-// Trust thresholds matching the backend
-const TRUST_THRESHOLDS = { MEDIUM: 2, HIGH: 9 }
 const TTL_MS = 10 * 60 * 1000
 
 function useElapsed(firstSeen) {
   const [elapsed, setElapsed] = useState(0)
   useEffect(() => {
-    const update = () => setElapsed(Date.now() - firstSeen * 1000)
+    const ts = (firstSeen || 0) * 1000
+    const update = () => setElapsed(Date.now() - ts)
     update()
     const t = setInterval(update, 5000)
     return () => clearInterval(t)
@@ -37,12 +36,13 @@ function formatAge(ms) {
 }
 
 function TrustBadge({ trust }) {
-  const m = TRUST_META[trust] || TRUST_META.LOW
+  const safeTrust = trust || 'LOW'
+  const m = TRUST_META[safeTrust] || TRUST_META.LOW
   const desc = {
     LOW:    '1 source only',
     MEDIUM: '2+ independent verifications',
     HIGH:   '9+ verifications or authorized',
-  }[trust]
+  }[safeTrust] || '1 source only'
   return (
     <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '3px' }}>
       <div style={{
@@ -51,30 +51,30 @@ function TrustBadge({ trust }) {
         background: m.bg, border: `1px solid ${m.border}`,
         color: m.color, fontSize: '11px', fontWeight: 700,
         letterSpacing: '0.08em', fontFamily: 'var(--mono)',
-        animation: 'badge-pop 0.3s ease',
       }}>
-        <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: m.color, flexShrink: 0 }}/>
-        {trust} TRUST
+        <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: m.color, flexShrink: 0 }} />
+        {safeTrust} TRUST
       </div>
       <div style={{ fontSize: '9px', color: 'var(--text-muted)', letterSpacing: '0.04em' }}>{desc}</div>
     </div>
   )
 }
 
-// Progress bar toward next trust level
 function TrustProgress({ crossChecks, trust }) {
+  const safeTrust = trust || 'LOW'
+  const safeChecks = crossChecks || 0
   let pct, nextLabel, nextAt
-  if (trust === 'HIGH') {
-    pct = 100; nextLabel = null
-  } else if (trust === 'MEDIUM') {
-    pct = Math.min(100, (crossChecks / TRUST_THRESHOLDS.HIGH) * 100)
-    nextLabel = 'HIGH'; nextAt = TRUST_THRESHOLDS.HIGH
+  if (safeTrust === 'HIGH') {
+    pct = 100; nextLabel = null; nextAt = null
+  } else if (safeTrust === 'MEDIUM') {
+    pct = Math.min(100, (safeChecks / 9) * 100)
+    nextLabel = 'HIGH'; nextAt = 9
   } else {
-    pct = Math.min(100, (crossChecks / TRUST_THRESHOLDS.MEDIUM) * 100)
-    nextLabel = 'MEDIUM'; nextAt = TRUST_THRESHOLDS.MEDIUM
+    pct = Math.min(100, (safeChecks / 2) * 100)
+    nextLabel = 'MEDIUM'; nextAt = 2
   }
-  const color = trust === 'HIGH' ? 'var(--trust-high)'
-              : trust === 'MEDIUM' ? 'var(--trust-medium)'
+  const color = safeTrust === 'HIGH' ? 'var(--trust-high)'
+              : safeTrust === 'MEDIUM' ? 'var(--trust-medium)'
               : 'var(--trust-low)'
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
@@ -82,64 +82,38 @@ function TrustProgress({ crossChecks, trust }) {
         <span style={{ fontSize: '9px', fontWeight: 700, color: 'var(--text-muted)', letterSpacing: '0.1em' }}>
           CROSS-VERIFICATION PROGRESS
         </span>
-        {nextLabel && (
-          <span style={{ fontSize: '9px', color: 'var(--text-muted)' }}>
-            {crossChecks}/{nextAt} → {nextLabel}
-          </span>
-        )}
-        {!nextLabel && (
-          <span style={{ fontSize: '9px', color: 'var(--trust-high)', fontWeight: 700 }}>✓ MAX TRUST</span>
-        )}
+        {nextLabel
+          ? <span style={{ fontSize: '9px', color: 'var(--text-muted)' }}>{safeChecks}/{nextAt} → {nextLabel}</span>
+          : <span style={{ fontSize: '9px', color: 'var(--trust-high)', fontWeight: 700 }}>✓ MAX TRUST</span>
+        }
       </div>
       <div style={{ height: '5px', borderRadius: '3px', background: 'var(--border)', overflow: 'hidden' }}>
-        <div style={{
-          height: '100%', width: `${pct}%`, borderRadius: '3px',
-          background: color, transition: 'width 0.5s ease',
-        }}/>
+        <div style={{ height: '100%', width: `${pct}%`, borderRadius: '3px', background: color, transition: 'width 0.5s ease' }} />
       </div>
-    </div>
-  )
-}
-
-function StatBox({ value, label, sublabel, color }) {
-  return (
-    <div style={styles.statBox}>
-      <div style={{ ...styles.statNum, color: color || 'var(--text-primary)' }}>{value}</div>
-      <div style={styles.statLabel}>{label}</div>
-      {sublabel && <div style={styles.statSub}>{sublabel}</div>}
-    </div>
-  )
-}
-
-function InfoTooltip({ text }) {
-  const [show, setShow] = useState(false)
-  return (
-    <div style={{ position: 'relative', display: 'inline-block' }}
-         onMouseEnter={() => setShow(true)} onMouseLeave={() => setShow(false)}>
-      <span style={{ fontSize: '10px', color: 'var(--text-muted)', cursor: 'help', marginLeft: '4px' }}>ⓘ</span>
-      {show && (
-        <div style={{
-          position: 'absolute', bottom: '120%', left: '50%', transform: 'translateX(-50%)',
-          background: 'var(--bg-card)', border: '1px solid var(--border-bright)',
-          borderRadius: '8px', padding: '8px 12px', width: '200px',
-          fontSize: '11px', color: 'var(--text-secondary)', lineHeight: 1.5,
-          boxShadow: '0 8px 24px rgba(0,0,0,0.4)', zIndex: 100, pointerEvents: 'none',
-        }}>
-          {text}
-        </div>
-      )}
     </div>
   )
 }
 
 function EventCard({ event }) {
-  const meta    = TYPE_META[event.type] || TYPE_META.UNKNOWN
-  const elapsed = useElapsed(event.first_seen)
-  const fading  = elapsed > TTL_MS
   const [expanded, setExpanded] = useState(false)
 
-  const crossChecks   = event.cross_checks    || 0
-  const devicesReached = event.devices_reached || 0
+  // ── Safely extract every field with fallbacks ──
+  const type            = event.type            || 'UNKNOWN'
+  const trust           = event.trust           || 'LOW'
+  const firstSeen       = event.first_seen      || 0
+  const maxHop          = event.max_hop         != null ? event.max_hop : 0
+  const crossChecks     = event.cross_checks    != null ? event.cross_checks : 0
+  const devicesReached  = event.devices_reached != null ? event.devices_reached : 0
+  const authorizedNode  = event.authorized_node || false
+  const description     = event.description     || ''
+  const location        = event.location        || ''
+  const originDevice    = event.origin_device   || ''
+  const reachedIds      = Array.isArray(event.devices_reached_ids) ? event.devices_reached_ids : []
+  const checkIds        = Array.isArray(event.cross_check_ids)     ? event.cross_check_ids     : []
+
+  const meta    = TYPE_META[type] || TYPE_META.UNKNOWN
+  const elapsed = useElapsed(firstSeen)
+  const fading  = elapsed > TTL_MS
 
   return (
     <div style={{
@@ -147,7 +121,6 @@ function EventCard({ event }) {
       borderLeft: `3px solid ${meta.color}`,
       opacity: fading ? 0.35 : 1,
       transition: 'opacity 1s ease',
-      animation: 'slide-in 0.25s ease',
     }}>
 
       {/* Row 1: Icon + type + trust badge */}
@@ -166,77 +139,85 @@ function EventCard({ event }) {
             </div>
             <div style={{ fontSize: '11px', color: 'var(--text-muted)', fontFamily: 'var(--mono)' }}>
               {formatAge(elapsed)}
-              {' · '}traveled {event.max_hop || 0} hop{event.max_hop !== 1 ? 's' : ''}
-              {event.authorized_node && (
+              {' · '}traveled {maxHop} hop{maxHop !== 1 ? 's' : ''}
+              {authorizedNode && (
                 <span style={{ color: 'var(--trust-high)', marginLeft: '6px', fontWeight: 700 }}>★ AUTHORIZED NODE</span>
               )}
             </div>
           </div>
         </div>
-        <TrustBadge trust={event.trust} />
+        <TrustBadge trust={trust} />
       </div>
 
-      {/* Row 2: Three clear stats */}
-      <div style={styles.statsRow}>
-        <StatBox
-          value={devicesReached}
-          label="devices reached"
-          sublabel="received this alert"
-        />
-        <div style={styles.statDivider}/>
-        <StatBox
-          value={crossChecks}
-          label="cross-checks"
-          sublabel="independently verified"
-          color={crossChecks >= 2 ? 'var(--trust-medium)' : crossChecks >= 9 ? 'var(--trust-high)' : undefined}
-        />
-        <div style={styles.statDivider}/>
-        <StatBox
-          value={event.max_hop || 0}
-          label="max hops"
-          sublabel="relay depth"
-        />
-      </div>
-
-      {/* Row 3: What these mean */}
-      <div style={styles.explainer}>
-        <div style={styles.explainerRow}>
-          <span style={styles.explainerDot('var(--accent-blue)')}/>
-          <span>
-            <strong style={{ color: 'var(--text-primary)' }}>Devices reached</strong>
-            {' '}— every machine that has received this alert through the mesh
-          </span>
+      {/* Description + location (only shown if present) */}
+      {(description || location) && (
+        <div style={styles.descBlock}>
+          {description && <div style={styles.descText}>"{description}"</div>}
+          {location    && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <span>📍</span>
+              <span style={styles.locationText}>{location}</span>
+            </div>
+          )}
         </div>
-        <div style={styles.explainerRow}>
-          <span style={styles.explainerDot(crossChecks > 0 ? 'var(--trust-medium)' : 'var(--text-muted)')}/>
-          <span>
-            <strong style={{ color: 'var(--text-primary)' }}>Cross-checks</strong>
-            {' '}— devices that independently re-broadcast it, verifying it as real.
-            Trust upgrades at 2 (MEDIUM) and 9 (HIGH).
-          </span>
-        </div>
-      </div>
-
-      {/* Row 4: Progress bar */}
-      {!event.authorized_node && (
-        <TrustProgress crossChecks={crossChecks} trust={event.trust} />
       )}
 
-      {/* Row 5: Device chips — expandable */}
+      {/* Row 2: Three stats */}
+      <div style={styles.statsRow}>
+        <div style={styles.statBox}>
+          <div style={styles.statNum}>{devicesReached}</div>
+          <div style={styles.statLabel}>devices reached</div>
+          <div style={styles.statSub}>received this alert</div>
+        </div>
+        <div style={styles.statDivider} />
+        <div style={styles.statBox}>
+          <div style={{ ...styles.statNum, color: crossChecks >= 2 ? 'var(--trust-medium)' : undefined }}>
+            {crossChecks}
+          </div>
+          <div style={styles.statLabel}>cross-checks</div>
+          <div style={styles.statSub}>independently verified</div>
+        </div>
+        <div style={styles.statDivider} />
+        <div style={styles.statBox}>
+          <div style={styles.statNum}>{maxHop}</div>
+          <div style={styles.statLabel}>max hops</div>
+          <div style={styles.statSub}>relay depth</div>
+        </div>
+      </div>
+
+      {/* What these mean */}
+      <div style={styles.explainer}>
+        <div style={styles.explainerRow}>
+          <span style={{ width: '7px', height: '7px', borderRadius: '50%', background: 'var(--accent-blue)', flexShrink: 0, marginTop: '3px' }} />
+          <span>
+            <strong style={{ color: 'var(--text-primary)' }}>Devices reached</strong>
+            {' '}— every machine that received this alert through the mesh
+          </span>
+        </div>
+        <div style={styles.explainerRow}>
+          <span style={{ width: '7px', height: '7px', borderRadius: '50%', background: crossChecks > 0 ? 'var(--trust-medium)' : 'var(--text-muted)', flexShrink: 0, marginTop: '3px' }} />
+          <span>
+            <strong style={{ color: 'var(--text-primary)' }}>Cross-checks</strong>
+            {' '}— devices that independently re-broadcast it. Trust upgrades at 2 (MEDIUM) and 9 (HIGH).
+          </span>
+        </div>
+      </div>
+
+      {/* Progress bar */}
+      {!authorizedNode && <TrustProgress crossChecks={crossChecks} trust={trust} />}
+
+      {/* Expandable device chip list */}
       {devicesReached > 0 && (
         <div>
-          <button
-            style={styles.expandBtn}
-            onClick={() => setExpanded(e => !e)}
-          >
+          <button style={styles.expandBtn} onClick={() => setExpanded(e => !e)}>
             {expanded ? '▾' : '▸'} {devicesReached} device{devicesReached !== 1 ? 's' : ''} in mesh
             {crossChecks > 0 && ` · ${crossChecks} verified`}
           </button>
-          {expanded && (
+          {expanded && reachedIds.length > 0 && (
             <div style={styles.chipGroups}>
-              {(event.devices_reached_ids || []).map(d => {
-                const isVerifier = (event.cross_check_ids || []).includes(d)
-                const isOrigin   = d === event.origin_device
+              {reachedIds.map(d => {
+                const isVerifier = checkIds.includes(d)
+                const isOrigin   = d === originDevice
                 return (
                   <span key={d} style={{
                     ...styles.deviceChip,
@@ -267,16 +248,19 @@ function EventCard({ event }) {
 export default function EventFeed({ events, onRefresh }) {
   const [filter, setFilter] = useState('ALL')
 
+  // Guard: ensure events is always an array
+  const safeEvents = Array.isArray(events) ? events : []
+
   const filtered = filter === 'ALL'
-    ? events
-    : events.filter(e => e.type === filter || e.trust === filter)
+    ? safeEvents
+    : safeEvents.filter(e => e.type === filter || e.trust === filter)
 
   return (
     <div style={styles.feed}>
       <div style={styles.toolbar}>
         <div style={styles.toolbarLeft}>
           <span style={styles.feedTitle}>Live Alerts</span>
-          <span style={styles.feedCount}>{events.length}</span>
+          <span style={styles.feedCount}>{safeEvents.length}</span>
         </div>
         <div style={styles.filters}>
           {['ALL', 'FIRE', 'MEDICAL', 'SECURITY', 'HIGH', 'MEDIUM', 'LOW'].map(f => (
@@ -297,7 +281,7 @@ export default function EventFeed({ events, onRefresh }) {
             <div style={styles.emptyIcon}>📡</div>
             <div style={styles.emptyTitle}>No Alerts Detected</div>
             <div style={styles.emptyText}>
-              MeshSentinel is listening on the mesh.<br/>
+              MeshSentinel is listening on the mesh.<br />
               When a peer broadcasts an emergency alert it will appear here instantly.
             </div>
           </div>
@@ -310,88 +294,42 @@ export default function EventFeed({ events, onRefresh }) {
 }
 
 const styles = {
-  feed:   { display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' },
+  feed:    { display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' },
   toolbar: {
     display: 'flex', alignItems: 'center', gap: '12px',
     padding: '12px 20px', borderBottom: '1px solid var(--border)',
     background: 'var(--bg-secondary)', flexShrink: 0,
   },
-  toolbarLeft: { display: 'flex', alignItems: 'center', gap: '8px', marginRight: 'auto' },
-  feedTitle: { fontSize: '13px', fontWeight: 700, color: 'var(--text-primary)', letterSpacing: '-0.01em' },
-  feedCount: {
-    background: 'var(--accent-blue)', color: '#fff',
-    fontSize: '11px', fontWeight: 700, padding: '1px 7px',
-    borderRadius: '20px', fontFamily: 'var(--mono)',
-  },
-  filters: { display: 'flex', gap: '4px' },
-  filterBtn: {
-    padding: '4px 10px', borderRadius: '6px', border: '1px solid var(--border)',
-    background: 'transparent', color: 'var(--text-muted)', fontSize: '10px',
-    fontWeight: 600, letterSpacing: '0.06em', cursor: 'pointer',
-    fontFamily: 'var(--font)', transition: 'all 0.15s ease',
-  },
+  toolbarLeft:     { display: 'flex', alignItems: 'center', gap: '8px', marginRight: 'auto' },
+  feedTitle:       { fontSize: '13px', fontWeight: 700, color: 'var(--text-primary)', letterSpacing: '-0.01em' },
+  feedCount:       { background: 'var(--accent-blue)', color: '#fff', fontSize: '11px', fontWeight: 700, padding: '1px 7px', borderRadius: '20px', fontFamily: 'var(--mono)' },
+  filters:         { display: 'flex', gap: '4px' },
+  filterBtn:       { padding: '4px 10px', borderRadius: '6px', border: '1px solid var(--border)', background: 'transparent', color: 'var(--text-muted)', fontSize: '10px', fontWeight: 600, letterSpacing: '0.06em', cursor: 'pointer', fontFamily: 'var(--font)', transition: 'all 0.15s ease' },
   filterBtnActive: { background: 'var(--accent-blue)', borderColor: 'var(--accent-blue)', color: '#fff' },
-  refreshBtn: {
-    width: '30px', height: '30px', borderRadius: '8px',
-    border: '1px solid var(--border)', background: 'transparent',
-    color: 'var(--text-secondary)', fontSize: '16px', cursor: 'pointer',
-    display: 'flex', alignItems: 'center', justifyContent: 'center',
-  },
-  cards: {
-    flex: 1, overflowY: 'auto', padding: '16px 20px',
-    display: 'flex', flexDirection: 'column', gap: '12px',
-  },
-  card: {
-    background: 'var(--bg-card)', border: '1px solid var(--border)',
-    borderRadius: '12px', padding: '16px',
-    display: 'flex', flexDirection: 'column', gap: '12px',
-  },
-  cardTop: { display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '12px' },
-  statsRow: {
-    display: 'flex', alignItems: 'stretch',
-    padding: '10px 0', borderTop: '1px solid var(--border)', borderBottom: '1px solid var(--border)',
-  },
-  statBox: { flex: 1, display: 'flex', flexDirection: 'column', gap: '2px', paddingLeft: '8px' },
-  statNum: { fontSize: '22px', fontWeight: 800, fontFamily: 'var(--mono)', lineHeight: 1 },
-  statLabel: { fontSize: '11px', color: 'var(--text-secondary)', fontWeight: 600 },
-  statSub:   { fontSize: '9px',  color: 'var(--text-muted)' },
-  statDivider: { width: '1px', background: 'var(--border)', margin: '0 8px', flexShrink: 0 },
-  explainer: {
-    background: 'var(--bg-secondary)', borderRadius: '8px',
-    padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: '6px',
-  },
-  explainerRow: {
-    display: 'flex', alignItems: 'flex-start', gap: '8px',
-    fontSize: '11px', color: 'var(--text-muted)', lineHeight: 1.5,
-  },
-  explainerDot: (color) => ({
-    width: '7px', height: '7px', borderRadius: '50%',
-    background: color, flexShrink: 0, marginTop: '3px',
-  }),
-  expandBtn: {
-    background: 'none', border: 'none', padding: '2px 0',
-    color: 'var(--text-muted)', fontSize: '11px', cursor: 'pointer',
-    fontFamily: 'var(--font)', textAlign: 'left',
-  },
-  chipGroups: { display: 'flex', flexWrap: 'wrap', gap: '4px', marginTop: '6px' },
-  deviceChip: {
-    fontFamily: 'var(--mono)', fontSize: '10px', color: 'var(--text-secondary)',
-    background: 'var(--bg-secondary)', padding: '2px 8px',
-    borderRadius: '4px', border: '1px solid var(--border)',
-  },
-  chipOrigin:   { color: 'var(--accent-blue)',   borderColor: 'rgba(59,130,246,0.4)',  background: 'rgba(59,130,246,0.08)'  },
-  chipVerifier: { color: 'var(--trust-medium)', borderColor: 'rgba(245,158,11,0.4)', background: 'rgba(245,158,11,0.08)' },
-  chipLegend: {
-    width: '100%', display: 'flex', gap: '12px', marginTop: '4px',
-    fontSize: '9px', color: 'var(--text-muted)', letterSpacing: '0.04em',
-  },
-  ttlNotice: { fontSize: '11px', color: 'var(--text-muted)', fontStyle: 'italic' },
-  empty: {
-    flex: 1, display: 'flex', flexDirection: 'column',
-    alignItems: 'center', justifyContent: 'center',
-    padding: '60px 20px', textAlign: 'center', gap: '12px',
-  },
-  emptyIcon:  { fontSize: '48px', opacity: 0.4 },
-  emptyTitle: { fontSize: '16px', fontWeight: 700, color: 'var(--text-secondary)' },
-  emptyText:  { fontSize: '13px', color: 'var(--text-muted)', lineHeight: 1.6 },
+  refreshBtn:      { width: '30px', height: '30px', borderRadius: '8px', border: '1px solid var(--border)', background: 'transparent', color: 'var(--text-secondary)', fontSize: '16px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' },
+  cards:           { flex: 1, overflowY: 'auto', padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: '12px' },
+  card:            { background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: '12px', padding: '16px', display: 'flex', flexDirection: 'column', gap: '12px' },
+  cardTop:         { display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '12px' },
+  statsRow:        { display: 'flex', alignItems: 'stretch', padding: '10px 0', borderTop: '1px solid var(--border)', borderBottom: '1px solid var(--border)' },
+  statBox:         { flex: 1, display: 'flex', flexDirection: 'column', gap: '2px', paddingLeft: '8px' },
+  statNum:         { fontSize: '22px', fontWeight: 800, fontFamily: 'var(--mono)', lineHeight: 1, color: 'var(--text-primary)' },
+  statLabel:       { fontSize: '11px', color: 'var(--text-secondary)', fontWeight: 600 },
+  statSub:         { fontSize: '9px', color: 'var(--text-muted)' },
+  statDivider:     { width: '1px', background: 'var(--border)', margin: '0 8px', flexShrink: 0 },
+  explainer:       { background: 'var(--bg-secondary)', borderRadius: '8px', padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: '6px' },
+  explainerRow:    { display: 'flex', alignItems: 'flex-start', gap: '8px', fontSize: '11px', color: 'var(--text-muted)', lineHeight: 1.5 },
+  expandBtn:       { background: 'none', border: 'none', padding: '2px 0', color: 'var(--text-muted)', fontSize: '11px', cursor: 'pointer', fontFamily: 'var(--font)', textAlign: 'left' },
+  chipGroups:      { display: 'flex', flexWrap: 'wrap', gap: '4px', marginTop: '6px' },
+  deviceChip:      { fontFamily: 'var(--mono)', fontSize: '10px', color: 'var(--text-secondary)', background: 'var(--bg-secondary)', padding: '2px 8px', borderRadius: '4px', border: '1px solid var(--border)' },
+  chipOrigin:      { color: 'var(--accent-blue)',  borderColor: 'rgba(59,130,246,0.4)',  background: 'rgba(59,130,246,0.08)'  },
+  chipVerifier:    { color: 'var(--trust-medium)', borderColor: 'rgba(245,158,11,0.4)', background: 'rgba(245,158,11,0.08)' },
+  chipLegend:      { width: '100%', display: 'flex', gap: '12px', marginTop: '4px', fontSize: '9px', color: 'var(--text-muted)', letterSpacing: '0.04em' },
+  descBlock:       { background: 'rgba(255,255,255,0.03)', borderRadius: '8px', padding: '10px 12px', borderLeft: '2px solid var(--border-bright)', display: 'flex', flexDirection: 'column', gap: '6px' },
+  descText:        { fontSize: '13px', color: 'var(--text-primary)', lineHeight: 1.6, fontStyle: 'italic' },
+  locationText:    { fontSize: '12px', color: 'var(--text-secondary)', fontWeight: 500 },
+  ttlNotice:       { fontSize: '11px', color: 'var(--text-muted)', fontStyle: 'italic' },
+  empty:           { flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '60px 20px', textAlign: 'center', gap: '12px' },
+  emptyIcon:       { fontSize: '48px', opacity: 0.4 },
+  emptyTitle:      { fontSize: '16px', fontWeight: 700, color: 'var(--text-secondary)' },
+  emptyText:       { fontSize: '13px', color: 'var(--text-muted)', lineHeight: 1.6 },
 }
