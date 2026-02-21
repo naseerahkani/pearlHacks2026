@@ -1,0 +1,95 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --bg-primary: #0a0e1a;
+  --bg-secondary: #0f1525;
+  --bg-card: #131929;
+  --bg-card-hover: #1a2138;
+  --border: #1e2d47;
+  --border-bright: #2a3f60;
+
+  --text-primary: #e8f0fe;
+  --text-secondary: #7b93bc;
+  --text-muted: #4a5f7a;
+
+  --accent-blue: #3b82f6;
+  --accent-blue-glow: rgba(59, 130, 246, 0.3);
+
+  --trust-low: #ef4444;
+  --trust-low-bg: rgba(239, 68, 68, 0.12);
+  --trust-low-border: rgba(239, 68, 68, 0.3);
+
+  --trust-medium: #f59e0b;
+  --trust-medium-bg: rgba(245, 158, 11, 0.12);
+  --trust-medium-border: rgba(245, 158, 11, 0.3);
+
+  --trust-high: #10b981;
+  --trust-high-bg: rgba(16, 185, 129, 0.12);
+  --trust-high-border: rgba(16, 185, 129, 0.3);
+
+  --fire: #f97316;
+  --medical: #3b82f6;
+  --security: #8b5cf6;
+
+  --font: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  --mono: 'JetBrains Mono', 'Courier New', monospace;
+}
+
+html, body {
+  height: 100%;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+#root {
+  height: 100%;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--bg-primary); }
+::-webkit-scrollbar-thumb { background: var(--border-bright); border-radius: 3px; }
+
+/* Animations */
+@keyframes pulse-green {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
+  50%       { box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
+}
+
+@keyframes pulse-red {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+  50%       { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); }
+}
+
+@keyframes pulse-panic {
+  0%, 100% { transform: scale(1);    box-shadow: 0 0 0 0   rgba(239, 68, 68, 0.6); }
+  50%       { transform: scale(1.03); box-shadow: 0 0 0 20px rgba(239, 68, 68, 0); }
+}
+
+@keyframes slide-in {
+  from { opacity: 0; transform: translateY(-12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fade-out {
+  from { opacity: 1; }
+  to   { opacity: 0.3; }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes badge-pop {
+  0%   { transform: scale(0.8); opacity: 0; }
+  60%  { transform: scale(1.1); }
+  100% { transform: scale(1);   opacity: 1; }
+}
