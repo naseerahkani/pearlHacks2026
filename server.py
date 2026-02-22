@@ -825,31 +825,39 @@ def build_cluster_prompt(events: list) -> str:
 
     events_json = json.dumps(event_summaries, indent=2)
 
-    prompt = f"""You are an emergency dispatch AI. Group the following alerts into clusters where each cluster represents the SAME real-world incident.
+    prompt = f"""You are an emergency dispatch AI clustering duplicate alert reports.
 
-Two alerts belong in the same cluster if they share a similar location AND a similar emergency type AND could plausibly be reports of the same event.
+Your job is to identify which alerts are describing THE SAME real-world incident reported by different people.
+Be AGGRESSIVE about grouping — in a real emergency, multiple people report the same thing in different words.
 
-Return ONLY valid JSON, no explanation, no markdown, no code fences. The JSON must be an array of cluster objects.
+Two alerts belong in the same cluster if ANY of these are true:
+- Same general location (even if described differently: "near the gym" vs "by the sports complex") AND same type
+- Same type AND descriptions that could plausibly describe the same incident even if worded differently
+- One description sounds like a paraphrase or restatement of another
 
-Each cluster object has exactly these fields:
+Do NOT split alerts into separate clusters just because the wording is different.
+If in doubt, GROUP THEM TOGETHER. False grouping is better than missed grouping.
+
+Return ONLY valid JSON — no explanation, no markdown, no code fences.
+The JSON must be an array of cluster objects, each with EXACTLY these fields:
 - "cluster_id": integer starting from 1
-- "label": short human-readable label for this incident (max 8 words)
-- "severity": "CRITICAL", "HIGH", or "MEDIUM" based on type and trust level
-- "type": the dominant emergency type (FIRE, MEDICAL, SECURITY, or MIXED)
-- "summary": one sentence describing the incident (max 20 words)
-- "event_ids": array of full_id strings that belong to this cluster
-- "recommended_action": brief action for responders (max 10 words)
+- "label": short human-readable incident label (max 8 words)
+- "severity": "CRITICAL", "HIGH", or "MEDIUM"
+- "type": dominant type — FIRE, MEDICAL, SECURITY, or MIXED
+- "summary": one sentence describing the incident as if writing it fresh (max 20 words)
+- "event_ids": array of full_id strings in this cluster
+- "recommended_action": brief responder action (max 10 words)
 
-Rules:
+Additional rules:
 - Every alert must appear in exactly one cluster
-- If an alert has no similar partner, it gets its own single-alert cluster
-- FIRE > SECURITY > MEDICAL for severity if types are mixed
-- Higher trust alerts should anchor the label and summary
+- Isolated alerts with no match get their own single-alert cluster
+- FIRE > SECURITY > MEDICAL for severity when mixed
+- Base the summary on the highest-trust alert in the cluster
 
-Alerts to cluster:
+Alerts:
 {events_json}
 
-Return only the JSON array:"""
+JSON array only:"""
 
     return prompt
 
