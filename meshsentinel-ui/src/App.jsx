@@ -122,7 +122,7 @@ function App() {
     return () => { clearInterval(t1); clearInterval(t2); clearInterval(t3) }
   }, [pollEvents, pollPeers, pollPending])
 
-  const handleBroadcast = async (type, isAuthorized = false, description = '', location = '') => {
+  const handleBroadcast = async (type, isAuthorized = false, description = '', location = '', imageUrl = null) => {
     const payload = {
       event_id:           crypto.randomUUID(),
       type,
@@ -131,6 +131,7 @@ function App() {
       is_authorized_node: isAuthorized,
       description:        description || '',
       location:           location    || '',
+      image_url:          imageUrl    || null,
     }
     try {
       const res = await fetch('/api/broadcast', {

@@ -16,6 +16,9 @@ import uuid
 import time
 import logging
 import difflib
+import pathlib
+from werkzeug.utils import secure_filename
+
 
 try:
     import netifaces
@@ -563,6 +566,11 @@ def start_subnet_scanner():
 app = Flask(__name__)
 CORS(app)
 
+IMAGE_DIR = pathlib.Path("uploads")
+IMAGE_DIR.mkdir(exist_ok=True)
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+MAX_IMAGE_BYTES    = 5 * 1024 * 1024   # 5 MB
+
 
 def serialize_event(eid: str) -> dict:
     entry = event_log[eid]
@@ -587,6 +595,7 @@ def serialize_event(eid: str) -> dict:
         "location":            p.get("location", ""),
         "pending_verify":      entry.get("pending_verify", False),
         "dismissed":           entry.get("dismissed", False),
+        "image_url": p.get("image_url", None),
     }
 
 
@@ -625,6 +634,7 @@ def broadcast():
         "is_authorized_node": data.get("is_authorized_node", False),
         "description":        data.get("description", "").strip()[:280],
         "location":           data.get("location", "").strip()[:100],
+        "image_url": data.get("image_url", None),
     }
     handle_packet(packet, relay=True)
     return jsonify({"status": "ok", "event_id": packet["event_id"]})
@@ -877,6 +887,37 @@ def emergency_contacts():
         {"name": "NC Emergency Management",      "number": "919-825-2500", "type": "state"},
         {"name": "Poison Control",               "number": "800-222-1222", "type": "medical"},
     ])
+
+@app.route("/api/images/upload", methods=["POST"])
+def upload_image():
+    if "image" not in request.files:
+        return jsonify({"error": "No image field"}), 400
+    f    = request.files["image"]
+    ext  = pathlib.Path(f.filename or "").suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        return jsonify({"error": "File type not allowed"}), 400
+    data = f.read()
+    if len(data) > MAX_IMAGE_BYTES:
+        return jsonify({"error": "File too large (max 5 MB)"}), 400
+    filename = f"{uuid.uuid4().hex}{ext}"
+    (IMAGE_DIR / filename).write_bytes(data)
+    log.info(f"📷 Image saved: {filename} ({len(data)//1024}KB)")
+    # Return a URL that any peer on the network can fetch
+    my_ip = get_my_ips()[0] if get_my_ips() else "127.0.0.1"
+    url   = f"http://{my_ip}:{FLASK_PORT}/api/images/{filename}"
+    return jsonify({"url": url, "filename": filename})
+
+@app.route("/api/images/<filename>", methods=["GET"])
+def serve_image(filename):
+    # Sanitize — only allow alphanumeric + dash + dot
+    import re
+    if not re.match(r'^[a-zA-Z0-9_\-]+\.[a-zA-Z]{2,5}$', filename):
+        return jsonify({"error": "Invalid filename"}), 400
+    path = IMAGE_DIR / filename
+    if not path.exists():
+        return jsonify({"error": "Not found"}), 404
+    from flask import send_file
+    return send_file(str(path))
 
 
 # ─────────────────────────────────────────────
