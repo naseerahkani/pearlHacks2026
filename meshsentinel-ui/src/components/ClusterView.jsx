@@ -47,7 +47,6 @@ function ClusterCard({ cluster, allEvents }) {
   const sev  = SEVERITY_META[cluster.severity] || SEVERITY_META.MEDIUM
   const icon = TYPE_ICONS[cluster.type]        || '⚠️'
 
-  // Find the full event objects for this cluster
   const clusterEvents = (allEvents || []).filter(e =>
     (cluster.event_ids || []).includes(e.event_id)
   )
@@ -57,7 +56,6 @@ function ClusterCard({ cluster, allEvents }) {
       ...styles.clusterCard,
       borderLeft: `3px solid ${sev.color}`,
     }}>
-      {/* Header row */}
       <div style={styles.clusterHeader}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flex: 1 }}>
           <div style={{
@@ -80,7 +78,6 @@ function ClusterCard({ cluster, allEvents }) {
             </div>
           </div>
         </div>
-        {/* Severity badge */}
         <div style={{
           display: 'inline-flex', alignItems: 'center', gap: '5px',
           padding: '4px 10px', borderRadius: '20px',
@@ -92,12 +89,10 @@ function ClusterCard({ cluster, allEvents }) {
         </div>
       </div>
 
-      {/* Summary */}
       {cluster.summary && (
         <div style={styles.clusterSummary}>"{cluster.summary}"</div>
       )}
 
-      {/* Recommended action */}
       {cluster.recommended_action && (
         <div style={styles.actionRow}>
           <span style={styles.actionIcon}>→</span>
@@ -105,7 +100,6 @@ function ClusterCard({ cluster, allEvents }) {
         </div>
       )}
 
-      {/* Expand to see individual reports */}
       <button style={styles.expandBtn} onClick={() => setExpanded(e => !e)}>
         {expanded ? '▾' : '▸'} {expanded ? 'Hide' : 'Show'} {clusterEvents.length} individual report{clusterEvents.length !== 1 ? 's' : ''}
       </button>
@@ -138,33 +132,30 @@ function ClusterCard({ cluster, allEvents }) {
 }
 
 export default function ClusterView({ events }) {
-  const [status,    setStatus]    = useState(null)
-  const [result,    setResult]    = useState(null)
-  const [loading,   setLoading]   = useState(false)
-  const [error,     setError]     = useState(null)
-  const [autoRun,   setAutoRun]   = useState(false)
+  const [status,  setStatus]  = useState(null)
+  const [result,  setResult]  = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [error,   setError]   = useState(null)
+  const [autoRun, setAutoRun] = useState(false)
   const safeEvents = Array.isArray(events) ? events : []
 
-  // Check Ollama status on mount
+  // ── Check Ollama status ──────────────────────────────────────────────────
   const checkStatus = useCallback(async () => {
     try {
       const res  = await fetch('/api/cluster/status')
       const data = await res.json()
       setStatus(data)
     } catch {
-      setStatus({ available: false, host: 'localhost', port: 11434, model: 'llama3.2:1b', model_ready: false, error: 'Backend unreachable' })
+      setStatus({
+        available: false, host: 'localhost', port: 11434,
+        model: 'llama3.2:1b', model_ready: false, error: 'Backend unreachable',
+      })
     }
   }, [])
 
   useEffect(() => { checkStatus() }, [checkStatus])
 
-  // Auto-run clustering when events change (if autoRun is on)
-  useEffect(() => {
-    if (autoRun && safeEvents.length > 0) {
-      runClustering(false)
-    }
-  }, [events, autoRun])
-
+  // ── Core clustering function — defined BEFORE any useEffect that calls it ──
   const runClustering = useCallback(async (force = true) => {
     if (safeEvents.length === 0) return
     setLoading(true)
@@ -188,7 +179,14 @@ export default function ClusterView({ events }) {
     }
   }, [safeEvents])
 
-  // ── Empty state ──
+  // ── Auto-run effect — placed AFTER runClustering is defined ─────────────
+  useEffect(() => {
+    if (autoRun && safeEvents.length > 0) {
+      runClustering(false)
+    }
+  }, [events, autoRun, runClustering])
+
+  // ── Empty state ──────────────────────────────────────────────────────────
   if (safeEvents.length === 0) {
     return (
       <div style={styles.container}>
@@ -196,7 +194,9 @@ export default function ClusterView({ events }) {
         <div style={styles.empty}>
           <div style={styles.emptyIcon}>🧠</div>
           <div style={styles.emptyTitle}>No alerts to cluster</div>
-          <div style={styles.emptyText}>Once alerts arrive on the mesh, cluster them here to identify which reports describe the same real-world incident.</div>
+          <div style={styles.emptyText}>
+            Once alerts arrive on the mesh, cluster them here to identify which reports describe the same real-world incident.
+          </div>
         </div>
       </div>
     )
@@ -223,7 +223,6 @@ export default function ClusterView({ events }) {
           )}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          {/* Auto-cluster toggle */}
           <label style={styles.autoLabel}>
             <input
               type="checkbox"
@@ -255,7 +254,10 @@ export default function ClusterView({ events }) {
           <div style={styles.explainerGrid}>
             <div style={styles.explainerStep}>
               <span style={styles.stepNum}>1</span>
-              <span>All {safeEvents.length} alert{safeEvents.length !== 1 ? 's' : ''} are sent to {status?.available ? `Ollama (${status.model})` : 'the rule-based engine'}</span>
+              <span>
+                All {safeEvents.length} alert{safeEvents.length !== 1 ? 's' : ''} are sent
+                to {status?.available ? `Ollama (${status.model})` : 'the rule-based engine'}
+              </span>
             </div>
             <div style={styles.explainerStep}>
               <span style={styles.stepNum}>2</span>
@@ -279,7 +281,7 @@ export default function ClusterView({ events }) {
           <div style={styles.loadingTitle}>Analysing {safeEvents.length} alerts…</div>
           <div style={styles.loadingText}>
             {status?.available
-              ? `Sending to ${OLLAMA_MODEL || 'llama3.2:1b'} at ${status.host} — may take 5–15 seconds`
+              ? `Sending to ${status?.model || 'llama3.2:1b'} at ${status?.host} — may take 5–15 seconds`
               : 'Running rule-based clustering…'}
           </div>
         </div>
@@ -296,7 +298,6 @@ export default function ClusterView({ events }) {
       {/* Results */}
       {result && !loading && (
         <div style={styles.clusters}>
-          {/* Sort: CRITICAL first */}
           {[...result.clusters]
             .sort((a, b) => {
               const order = { CRITICAL: 0, HIGH: 1, MEDIUM: 2 }
@@ -343,7 +344,7 @@ const styles = {
   explainerStep:  { display: 'flex', alignItems: 'flex-start', gap: '10px', fontSize: '12px', color: 'var(--text-secondary)' },
   stepNum:        { width: '20px', height: '20px', borderRadius: '50%', background: 'var(--accent-blue)', color: '#fff', fontSize: '11px', fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
   loadingBox:     { flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', padding: '40px' },
-  loadingSpinner: { fontSize: '36px', animation: 'pulse-panic 1.5s ease-in-out infinite' },
+  loadingSpinner: { fontSize: '36px' },
   loadingTitle:   { fontSize: '16px', fontWeight: 700, color: 'var(--text-primary)' },
   loadingText:    { fontSize: '13px', color: 'var(--text-muted)', textAlign: 'center', maxWidth: '320px', lineHeight: 1.6 },
   errorBox:       { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', margin: '16px 20px', background: 'rgba(239,68,68,0.06)', border: '1px solid rgba(239,68,68,0.2)', borderRadius: '10px', padding: '12px 16px', fontSize: '13px', color: 'var(--trust-low)' },

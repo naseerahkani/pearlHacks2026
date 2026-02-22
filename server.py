@@ -694,7 +694,7 @@ Return only the JSON array:"""
     return prompt
 
 
-def call_ollama(prompt: str, timeout: int = 30) -> str | None:
+def call_ollama(prompt: str, timeout: int = 120) -> str | None:
     """
     Call Ollama's /api/generate endpoint with stream=False.
     Returns the response text or None on failure.
@@ -861,7 +861,7 @@ def cluster_events():
 
     if ollama_available:
         prompt   = build_cluster_prompt(events)
-        raw_resp = call_ollama(prompt, timeout=30)
+        raw_resp = call_ollama(prompt, timeout=120)
         clusters = parse_cluster_response(raw_resp, events)
         source   = "ollama"
         log.info(f"Ollama clustering: {len(events)} events → {len(clusters)} clusters")
