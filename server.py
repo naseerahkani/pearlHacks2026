@@ -32,8 +32,8 @@ from flask_cors import CORS
 SOCKET_PORT        = 5555
 FLASK_PORT         = 5000
 DISCOVERY_PORT     = 5556
-DISCOVERY_INTERVAL = 3
-PEER_TIMEOUT       = 15
+DISCOVERY_INTERVAL = 2          # announce more frequently (was 3)
+PEER_TIMEOUT       = 30         # longer timeout so one missed beat doesn't drop peer (was 15)
 
 MY_DEVICE_ID = f"DEVICE-{uuid.uuid4().hex[:8].upper()}"
 
@@ -42,22 +42,10 @@ MY_DEVICE_ID = f"DEVICE-{uuid.uuid4().hex[:8].upper()}"
 # ─────────────────────────────────────────────
 
 event_log: dict = {}
-# { event_id: {
-#     packet              : original packet dict
-#     devices_reached     : set of device IDs that received this alert
-#     cross_checks        : set of device IDs that manually verified it
-#     pending_verify      : bool — arrived from a peer, not yet acted on by THIS device
-#     dismissed           : bool — this device explicitly said "cannot confirm"
-#     authorized_node     : bool
-#     trust               : "LOW" | "MEDIUM" | "HIGH"
-#     max_hop             : highest hop number seen
-#     first_seen          : unix timestamp
-# }}
+hop_log:   dict = {}
 
-hop_log: dict = {}
-
-manual_peers:     list = []
-discovered_peers: dict = {}
+manual_peers:       list = []
+discovered_peers:   dict = {}
 active_connections: list = []
 
 peers_lock     = threading.Lock()
@@ -91,12 +79,26 @@ def get_my_ips() -> list:
             ips.append(s.getsockname()[0])
             s.close()
         except Exception:
-            ips.append("127.0.0.1")
-    return ips
+            # Offline fallback — try connecting to a LAN address to get our IP
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("192.168.1.1", 80))
+                ips.append(s.getsockname()[0])
+                s.close()
+            except Exception:
+                ips.append("127.0.0.1")
+    return list(set(ips))
 
 
 def get_broadcast_addresses() -> list:
-    broadcasts = []
+    """
+    Return all subnet broadcast addresses we should announce on.
+    Also always includes 255.255.255.255 as a fallback.
+    WiFi Direct typically uses 192.168.49.x or 192.168.137.x subnets.
+    """
+    broadcasts = set()
+    broadcasts.add("255.255.255.255")
+
     if HAS_NETIFACES:
         try:
             for iface in netifaces.interfaces():
@@ -104,16 +106,17 @@ def get_broadcast_addresses() -> list:
                 for a in addrs.get(netifaces.AF_INET, []):
                     bcast = a.get("broadcast", "")
                     if bcast and not bcast.startswith("127."):
-                        broadcasts.append(bcast)
+                        broadcasts.add(bcast)
         except Exception:
             pass
-    if not broadcasts:
-        for ip in get_my_ips():
-            parts = ip.rsplit(".", 1)
-            if len(parts) == 2:
-                broadcasts.append(parts[0] + ".255")
-        broadcasts.append("255.255.255.255")
-    return list(set(broadcasts))
+
+    # Always derive broadcast from our own IPs as a fallback
+    for ip in get_my_ips():
+        parts = ip.rsplit(".", 1)
+        if len(parts) == 2:
+            broadcasts.add(parts[0] + ".255")
+
+    return list(broadcasts)
 
 
 def get_all_known_peers() -> list:
@@ -131,10 +134,6 @@ def get_all_known_peers() -> list:
 # ─────────────────────────────────────────────
 
 def calculate_trust(event_id: str) -> str:
-    """
-    Trust is based solely on manual cross-checks — humans who explicitly
-    confirmed they can witness this event. Auto-relay does NOT count.
-    """
     entry = event_log.get(event_id, {})
     if entry.get("authorized_node"):
         return "HIGH"
@@ -170,22 +169,6 @@ def record_hop(event_id: str, from_device: str, to_device: str,
 # ─────────────────────────────────────────────
 
 def handle_packet(packet: dict, relay: bool = True, received_from_ip: str = ""):
-    """
-    Process an incoming alert packet.
-
-    Originating device (received_from_ip == ""):
-      - Stores the event, sets pending_verify=False (you sent it, nothing to verify)
-      - Relays to all peers
-
-    Receiving device (received_from_ip set):
-      - Stores the event, sets pending_verify=True  ← awaits human YES/NO
-      - Relays to all peers (propagation continues regardless of human decision)
-      - Does NOT auto-add to cross_checks
-
-    Duplicate event_id:
-      - Skips storage (already seen)
-      - Does NOT re-relay (prevents loops)
-    """
     eid = packet.get("event_id")
     if not eid:
         return
@@ -202,16 +185,14 @@ def handle_packet(packet: dict, relay: bool = True, received_from_ip: str = ""):
 
     with event_lock:
         if eid in event_log:
-            # Duplicate — just update sender tracking, do NOT re-relay
             event_log[eid]["devices_reached"].add(sender_device)
             return
 
-        # New event — store it
         event_log[eid] = {
             "packet":          packet,
             "devices_reached": {my_device, sender_device},
             "cross_checks":    set(),
-            "pending_verify":  from_peer,   # True = needs human decision on this device
+            "pending_verify":  from_peer,
             "dismissed":       False,
             "authorized_node": bool(packet.get("is_authorized_node")),
             "trust":           "LOW",
@@ -224,7 +205,6 @@ def handle_packet(packet: dict, relay: bool = True, received_from_ip: str = ""):
         log.info(f"{'📥 Received' if from_peer else '📤 Originated'} event {eid[:8]}… "
                  f"type={packet.get('type')} pending_verify={from_peer}")
 
-    # Always relay new events onward (mesh propagation is independent of verification)
     if relay:
         augmented = dict(packet)
         augmented["hop_count"] = hop_num + 1
@@ -240,6 +220,9 @@ def handle_connection(conn, addr):
     try:
         with peers_lock:
             active_connections.append(conn)
+        # Register as discovered peer whenever a TCP connection arrives
+        with discovery_lock:
+            discovered_peers[peer_ip] = time.time()
         log.info(f"TCP peer connected: {addr}")
         buffer = b""
         while True:
@@ -286,7 +269,7 @@ def relay_to_peers(packet: dict, origin_event_id: str = ""):
     for peer_ip in get_all_known_peers():
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(2)
+            s.settimeout(3)
             s.connect((peer_ip, SOCKET_PORT))
             s.sendall(data)
             s.close()
@@ -299,7 +282,7 @@ def relay_to_peers(packet: dict, origin_event_id: str = ""):
             log.debug(f"Could not reach peer {peer_ip}: {e}")
 
 # ─────────────────────────────────────────────
-# UDP Auto-Discovery
+# UDP Auto-Discovery  (primary method)
 # ─────────────────────────────────────────────
 
 DISCOVERY_MAGIC = b"MESHSENTINEL_HELLO_v1|"
@@ -318,15 +301,17 @@ def start_discovery_announcer():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    payload = build_announcement()
     log.info(f"UDP announcer started (every {DISCOVERY_INTERVAL}s)")
     while True:
         try:
-            for bcast in get_broadcast_addresses():
+            payload   = build_announcement()   # rebuild each time — IPs may change
+            brodcasts = get_broadcast_addresses()
+            for bcast in brodcasts:
                 try:
                     sock.sendto(payload, (bcast, DISCOVERY_PORT))
-                except Exception:
-                    pass
+                    log.debug(f"UDP announcement → {bcast}:{DISCOVERY_PORT}")
+                except Exception as e:
+                    log.debug(f"Broadcast to {bcast} failed: {e}")
         except Exception as e:
             log.warning(f"Announcer error: {e}")
         time.sleep(DISCOVERY_INTERVAL)
@@ -358,7 +343,9 @@ def start_discovery_listener():
                 is_new = peer_ip not in discovered_peers
                 discovered_peers[peer_ip] = time.time()
             if is_new:
-                log.info(f"✅ Discovered peer: {peer_ip} [{meta.get('device_id','?')}]")
+                log.info(f"✅ Discovered peer via UDP: {peer_ip} [{meta.get('device_id','?')}]")
+            else:
+                log.debug(f"Refreshed peer: {peer_ip}")
         except socket.timeout:
             continue
         except Exception as e:
@@ -367,14 +354,119 @@ def start_discovery_listener():
 
 
 def start_peer_reaper():
+    """Remove peers we haven't heard from in PEER_TIMEOUT seconds."""
     while True:
-        time.sleep(PEER_TIMEOUT)
+        time.sleep(PEER_TIMEOUT // 2)
         now = time.time()
         with discovery_lock:
             expired = [ip for ip, ts in discovered_peers.items() if now - ts > PEER_TIMEOUT]
             for ip in expired:
                 del discovered_peers[ip]
                 log.info(f"⏰ Peer timed out: {ip}")
+
+
+# ─────────────────────────────────────────────
+# TCP Peer Keepalive  (secondary/backup discovery)
+# Periodically pings all known peers over TCP so they register
+# us in their discovered_peers even if UDP broadcast is blocked.
+# ─────────────────────────────────────────────
+
+KEEPALIVE_INTERVAL = 5   # seconds between keepalive pings
+
+def build_keepalive_packet() -> dict:
+    return {
+        "type":      "KEEPALIVE",
+        "device_id": MY_DEVICE_ID,
+        "event_id":  None,          # no event — just a presence ping
+        "hop_count": 0,
+        "timestamp": int(time.time()),
+    }
+
+def start_tcp_keepalive():
+    """
+    Send a KEEPALIVE packet to every known peer every few seconds.
+    When the peer's TCP server receives this connection it registers
+    our IP in discovered_peers (see handle_connection above).
+    We intentionally send a packet that handle_packet will ignore
+    (event_id is None) — the value is the TCP connection itself.
+    """
+    time.sleep(5)   # let other threads start first
+    log.info(f"TCP keepalive started (every {KEEPALIVE_INTERVAL}s)")
+    while True:
+        for peer_ip in get_all_known_peers():
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(2)
+                s.connect((peer_ip, SOCKET_PORT))
+                # Send a minimal keepalive — peer will register our IP on connect
+                ka = (json.dumps(build_keepalive_packet()) + "\n").encode()
+                s.sendall(ka)
+                s.close()
+                # Also refresh their entry in our own discovered_peers
+                with discovery_lock:
+                    discovered_peers[peer_ip] = time.time()
+                log.debug(f"Keepalive → {peer_ip} ✓")
+            except Exception as e:
+                log.debug(f"Keepalive failed for {peer_ip}: {e}")
+        time.sleep(KEEPALIVE_INTERVAL)
+
+
+# ─────────────────────────────────────────────
+# Subnet Scanner  (tertiary discovery for WiFi Direct)
+# When UDP broadcast is blocked (common on WiFi Direct / hotspot),
+# scan the local /24 subnet for any host with port 5555 open.
+# Runs once at startup and then every 30 seconds.
+# ─────────────────────────────────────────────
+
+SCAN_INTERVAL  = 30    # seconds between subnet scans
+SCAN_TIMEOUT   = 0.3   # seconds per host probe
+
+def scan_subnet_for_peers():
+    """
+    Probe every .1–.254 address on our subnet for an open SOCKET_PORT.
+    This is the most reliable method when UDP broadcast is blocked by
+    WiFi Direct drivers (common on Windows and some Android hotspots).
+    """
+    my_ips = get_my_ips()
+    if not my_ips:
+        return
+    found = 0
+    for my_ip in my_ips:
+        parts = my_ip.rsplit(".", 1)
+        if len(parts) != 2:
+            continue
+        prefix = parts[0]
+        log.info(f"🔍 Scanning subnet {prefix}.1-254 for peers…")
+        for i in range(1, 255):
+            target = f"{prefix}.{i}"
+            if target in set(get_my_ips()):
+                continue
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(SCAN_TIMEOUT)
+                result = s.connect_ex((target, SOCKET_PORT))
+                s.close()
+                if result == 0:
+                    with discovery_lock:
+                        is_new = target not in discovered_peers
+                        discovered_peers[target] = time.time()
+                    if is_new:
+                        log.info(f"✅ Discovered peer via scan: {target}")
+                    found += 1
+            except Exception:
+                pass
+    log.info(f"🔍 Subnet scan complete — {found} peer(s) found")
+
+
+def start_subnet_scanner():
+    time.sleep(3)   # wait for network to stabilise after startup
+    while True:
+        try:
+            scan_subnet_for_peers()
+        except Exception as e:
+            log.warning(f"Subnet scanner error: {e}")
+        time.sleep(SCAN_INTERVAL)
+
 
 # ─────────────────────────────────────────────
 # Flask Application
@@ -384,7 +476,7 @@ app = Flask(__name__)
 CORS(app)
 
 
-def serialize_event(eid: str, include_pending: bool = True) -> dict:
+def serialize_event(eid: str) -> dict:
     entry = event_log[eid]
     p     = entry["packet"]
     original        = p.get("device_id", "")
@@ -405,7 +497,6 @@ def serialize_event(eid: str, include_pending: bool = True) -> dict:
         "is_authorized_node":  p.get("is_authorized_node", False),
         "description":         p.get("description", ""),
         "location":            p.get("location", ""),
-        # These two fields tell the UI what action state this device is in
         "pending_verify":      entry.get("pending_verify", False),
         "dismissed":           entry.get("dismissed", False),
     }
@@ -421,18 +512,13 @@ def get_events():
 
 @app.route("/api/pending-verifications", methods=["GET"])
 def get_pending_verifications():
-    """
-    Returns events that arrived from a peer and have not yet been acted on
-    by the human at THIS device (neither verified nor dismissed).
-    The UI polls this endpoint to drive the verification prompt.
-    """
     with event_lock:
         pending = [
             serialize_event(eid)
             for eid, entry in event_log.items()
             if entry.get("pending_verify") and not entry.get("dismissed")
         ]
-    pending.sort(key=lambda e: e["first_seen"])  # oldest first
+    pending.sort(key=lambda e: e["first_seen"])
     return jsonify({"count": len(pending), "events": pending})
 
 
@@ -485,6 +571,9 @@ def add_peer():
     with peers_lock:
         if ip not in manual_peers:
             manual_peers.append(ip)
+    # Also immediately scan this peer so it registers right away
+    with discovery_lock:
+        discovered_peers[ip] = time.time()
     return jsonify({"status": "ok", "known_peers": get_all_known_peers()})
 
 
@@ -567,13 +656,6 @@ def get_hops():
 
 @app.route("/api/events/<event_id>/verify", methods=["POST"])
 def verify_event(event_id: str):
-    """
-    Human confirms: "I can witness this emergency."
-    Adds this device to cross_checks, clears pending_verify flag,
-    re-broadcasts the packet AND pushes a lightweight sync to all peers
-    so their dashboards update the cross_check count without waiting for
-    the next relay cycle.
-    """
     with event_lock:
         if event_id not in event_log:
             return jsonify({"error": "Event not found"}), 404
@@ -592,22 +674,24 @@ def verify_event(event_id: str):
     log.info(f"✅ Manual verify: {MY_DEVICE_ID[-8:]} confirmed {event_id[:8]}… "
              f"checks={cross_count} trust={new_trust}")
 
+    # Re-broadcast full packet
     entry  = event_log[event_id]
     packet = dict(entry["packet"])
     packet["hop_count"] = entry["max_hop"] + 1
     packet["device_id"] = MY_DEVICE_ID
     relay_to_peers(packet, origin_event_id=event_id)
 
+    # Push lightweight sync to all peers so their dashboards update immediately
     sync_payload = json.dumps({
-        "verified_by": MY_DEVICE_ID,
-        "trust":       new_trust,
+        "verified_by":  MY_DEVICE_ID,
+        "trust":        new_trust,
         "cross_checks": cross_count,
     }).encode()
 
     def push_sync():
+        import urllib.request as _ur
         for peer_ip in get_all_known_peers():
             try:
-                import urllib.request as _ur
                 req = _ur.Request(
                     f"http://{peer_ip}:{FLASK_PORT}/api/events/{event_id}/sync",
                     data=sync_payload,
@@ -619,7 +703,6 @@ def verify_event(event_id: str):
             except Exception as e:
                 log.debug(f"Sync push failed for {peer_ip}: {e}")
 
-    # Run sync pushes in background so we don't block the response
     threading.Thread(target=push_sync, daemon=True).start()
 
     return jsonify({
@@ -630,13 +713,31 @@ def verify_event(event_id: str):
     })
 
 
+@app.route("/api/events/<event_id>/sync", methods=["POST"])
+def sync_event_verification(event_id: str):
+    """
+    Lightweight push from a peer after they verify — updates our in-memory
+    cross_checks so the dashboard reflects it without waiting for next relay.
+    """
+    data      = request.get_json(force=True, silent=True) or {}
+    verifier  = data.get("verified_by", "")
+    new_trust = data.get("trust", "")
+
+    with event_lock:
+        if event_id not in event_log:
+            return jsonify({"status": "unknown_event"}), 404
+        if verifier:
+            event_log[event_id]["cross_checks"].add(verifier)
+        if new_trust in ("LOW", "MEDIUM", "HIGH"):
+            event_log[event_id]["trust"] = new_trust
+        event_log[event_id]["trust"] = calculate_trust(event_id)
+
+    log.info(f"🔄 Sync received: {verifier[-8:] if verifier else '?'} verified {event_id[:8]}…")
+    return jsonify({"status": "ok", "trust": event_log[event_id]["trust"]})
+
+
 @app.route("/api/events/<event_id>/dismiss", methods=["POST"])
 def dismiss_event(event_id: str):
-    """
-    Human says: "I cannot confirm this — dismiss the verification prompt."
-    The alert stays visible in the feed, but this device won't be asked again.
-    Does NOT add to cross_checks, does NOT relay anything.
-    """
     with event_lock:
         if event_id not in event_log:
             return jsonify({"error": "Event not found"}), 404
@@ -647,14 +748,53 @@ def dismiss_event(event_id: str):
     return jsonify({"status": "ok"})
 
 
+@app.route("/api/events/<event_id>/authorize", methods=["POST"])
+def authorize_event(event_id: str):
+    with event_lock:
+        if event_id not in event_log:
+            return jsonify({"error": "Event not found"}), 404
+        event_log[event_id]["authorized_node"] = True
+        event_log[event_id]["pending_verify"]  = False
+        event_log[event_id]["trust"]           = "HIGH"
+    return jsonify({"status": "ok", "trust": "HIGH"})
+
+
+@app.route("/api/events", methods=["DELETE"])
+def clear_events():
+    with event_lock:
+        event_log.clear()
+    with hop_lock:
+        hop_log.clear()
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/scan", methods=["POST"])
+def trigger_scan():
+    """Manually trigger a subnet scan — useful when auto-discovery is slow."""
+    threading.Thread(target=scan_subnet_for_peers, daemon=True).start()
+    return jsonify({"status": "scanning", "subnets": [
+        ip.rsplit(".", 1)[0] + ".0/24" for ip in get_my_ips()
+    ]})
+
+
+@app.route("/api/emergency-contacts", methods=["GET"])
+def emergency_contacts():
+    return jsonify([
+        {"name": "UNC Campus Police",           "number": "919-962-8100", "type": "police"},
+        {"name": "Chapel Hill Police Dispatch",  "number": "919-968-2760", "type": "police"},
+        {"name": "UNC Health ER",                "number": "919-966-4131", "type": "medical"},
+        {"name": "Chapel Hill Fire Dept",        "number": "919-968-2784", "type": "fire"},
+        {"name": "Orange County 911",            "number": "911",          "type": "emergency"},
+        {"name": "Duke Energy Outage Line",      "number": "800-769-3766", "type": "utility"},
+        {"name": "NC Emergency Management",      "number": "919-825-2500", "type": "state"},
+        {"name": "Poison Control",               "number": "800-222-1222", "type": "medical"},
+    ])
+
+
 # ─────────────────────────────────────────────
 # Ollama Clustering
 # ─────────────────────────────────────────────
 
-# Only ONE machine on the network needs Ollama installed (the hotspot host).
-# Other machines point OLLAMA_HOST to that machine's IP, e.g. "192.168.137.1"
-# Set via environment variable: OLLAMA_HOST=192.168.137.1 python server.py
-# Defaults to localhost so the host machine works out of the box.
 import os
 import re
 import urllib.request
@@ -664,21 +804,16 @@ OLLAMA_PORT  = int(os.environ.get("OLLAMA_PORT", "11434"))
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:1b")
 OLLAMA_URL   = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/generate"
 
-# Cache: store last cluster result so UI can re-poll cheaply
 _cluster_cache: dict = {"result": None, "computed_at": 0, "event_ids": []}
 _cluster_lock = threading.Lock()
-CLUSTER_CACHE_TTL = 10  # seconds before we recompute
+CLUSTER_CACHE_TTL = 10
 
 
 def build_cluster_prompt(events: list) -> str:
-    """
-    Build a tight prompt that tells the model exactly what JSON shape to return.
-    We include only the fields that matter for clustering: type, description, location, timestamp.
-    """
     event_summaries = []
     for e in events:
         summary = {
-            "id":          e["event_id"][:8],   # short ID to save tokens
+            "id":          e["event_id"][:8],
             "full_id":     e["event_id"],
             "type":        e["type"],
             "description": e.get("description", "") or "(no description)",
@@ -720,17 +855,13 @@ Return only the JSON array:"""
 
 
 def call_ollama(prompt: str, timeout: int = 120) -> str | None:
-    """
-    Call Ollama's /api/generate endpoint with stream=False.
-    Returns the response text or None on failure.
-    """
     payload = json.dumps({
         "model":  OLLAMA_MODEL,
         "prompt": prompt,
         "stream": False,
         "options": {
-            "temperature": 0.1,   # low temp = more deterministic JSON
-            "num_predict": 800,   # enough for ~10 clusters
+            "temperature": 0.1,
+            "num_predict": 800,
         }
     }).encode("utf-8")
 
@@ -742,7 +873,7 @@ def call_ollama(prompt: str, timeout: int = 120) -> str | None:
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data   = json.loads(resp.read().decode("utf-8"))
+            data = json.loads(resp.read().decode("utf-8"))
             return data.get("response", "")
     except Exception as e:
         log.warning(f"Ollama call failed: {e}")
@@ -750,10 +881,6 @@ def call_ollama(prompt: str, timeout: int = 120) -> str | None:
 
 
 def fallback_clusters(events: list) -> list:
-    """
-    Rule-based fallback when Ollama is unavailable.
-    Groups by (type, location prefix) — simple but useful.
-    """
     SEVERITY = {"FIRE": "CRITICAL", "SECURITY": "HIGH", "MEDICAL": "HIGH", "UNKNOWN": "MEDIUM"}
     groups   = {}
     for e in events:
@@ -780,23 +907,14 @@ def fallback_clusters(events: list) -> list:
 
 
 def parse_cluster_response(raw: str, events: list) -> list:
-    """
-    Parse the model's JSON response. Very defensive — handles:
-    - Extra whitespace / newlines
-    - Markdown code fences (```json ... ```)
-    - Partial event_ids (8-char prefixes vs full UUIDs)
-    Falls back to fallback_clusters() if JSON is invalid.
-    """
     if not raw:
         return fallback_clusters(events)
 
-    # Strip markdown fences if present
     text = raw.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$",          "", text)
     text = text.strip()
 
-    # Find the JSON array (ignore any leading/trailing prose)
     match = re.search(r"\[.*\]", text, re.DOTALL)
     if not match:
         log.warning("Ollama response had no JSON array — using fallback")
@@ -808,17 +926,15 @@ def parse_cluster_response(raw: str, events: list) -> list:
         log.warning(f"Ollama JSON parse error: {e} — using fallback")
         return fallback_clusters(events)
 
-    # Build a map from 8-char prefix → full event_id for matching
     prefix_map = {e["event_id"][:8]: e["event_id"] for e in events}
     all_full   = {e["event_id"] for e in events}
 
-    # Normalise clusters — expand short IDs, validate structure
     seen_event_ids = set()
     clean = []
     for c in clusters:
         if not isinstance(c, dict):
             continue
-        raw_ids = c.get("event_ids", [])
+        raw_ids  = c.get("event_ids", [])
         full_ids = []
         for rid in raw_ids:
             if rid in all_full:
@@ -839,7 +955,6 @@ def parse_cluster_response(raw: str, events: list) -> list:
             "source":             "ollama",
         })
 
-    # Any events the model missed → own cluster
     missed = [e for e in events if e["event_id"] not in seen_event_ids]
     if missed:
         clean.extend(fallback_clusters(missed))
@@ -849,12 +964,6 @@ def parse_cluster_response(raw: str, events: list) -> list:
 
 @app.route("/api/cluster", methods=["POST"])
 def cluster_events():
-    """
-    Trigger Ollama clustering of all current events.
-    Returns cached result if events haven't changed and cache is fresh.
-
-    POST body (optional): { "force": true }  — bypass cache
-    """
     body  = request.get_json(force=True, silent=True) or {}
     force = body.get("force", False)
 
@@ -866,7 +975,6 @@ def cluster_events():
 
     current_ids = sorted(e["event_id"] for e in events)
 
-    # Return cache if still fresh and events haven't changed
     with _cluster_lock:
         cache = _cluster_cache
         if (not force
@@ -875,7 +983,6 @@ def cluster_events():
                 and cache["event_ids"] == current_ids):
             return jsonify({**cache["result"], "cached": True})
 
-    # Check Ollama availability first
     try:
         check = urllib.request.urlopen(
             f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/tags", timeout=2
@@ -916,7 +1023,6 @@ def cluster_events():
 
 @app.route("/api/cluster/status", methods=["GET"])
 def cluster_status():
-    """Quick check: is Ollama reachable and which model is loaded?"""
     try:
         resp = urllib.request.urlopen(
             f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/tags", timeout=2
@@ -942,66 +1048,6 @@ def cluster_status():
         })
 
 
-@app.route("/api/events/<event_id>/authorize", methods=["POST"])
-def authorize_event(event_id: str):
-    with event_lock:
-        if event_id not in event_log:
-            return jsonify({"error": "Event not found"}), 404
-        event_log[event_id]["authorized_node"] = True
-        event_log[event_id]["pending_verify"]  = False
-        event_log[event_id]["trust"]           = "HIGH"
-    return jsonify({"status": "ok", "trust": "HIGH"})
-
-
-@app.route("/api/events", methods=["DELETE"])
-def clear_events():
-    with event_lock:
-        event_log.clear()
-    with hop_lock:
-        hop_log.clear()
-    return jsonify({"status": "ok"})
-
-
-@app.route("/api/emergency-contacts", methods=["GET"])
-def emergency_contacts():
-    return jsonify([
-        {"name": "UNC Campus Police",           "number": "919-962-8100", "type": "police"},
-        {"name": "Chapel Hill Police Dispatch",  "number": "919-968-2760", "type": "police"},
-        {"name": "UNC Health ER",                "number": "919-966-4131", "type": "medical"},
-        {"name": "Chapel Hill Fire Dept",        "number": "919-968-2784", "type": "fire"},
-        {"name": "Orange County 911",            "number": "911",          "type": "emergency"},
-        {"name": "Duke Energy Outage Line",      "number": "800-769-3766", "type": "utility"},
-        {"name": "NC Emergency Management",      "number": "919-825-2500", "type": "state"},
-        {"name": "Poison Control",               "number": "800-222-1222", "type": "medical"},
-    ])
-    
-@app.route("/api/events/<event_id>/sync", methods=["POST"])
-def sync_event_verification(event_id: str):
-    """
-    Called by a peer after they verify an event, so THIS device's in-memory
-    state reflects the updated cross_checks without needing a full relay decode.
-    Body: { "verified_by": "<device_id>", "cross_checks": N, "trust": "..." }
-    """
-    data = request.get_json(force=True, silent=True) or {}
-    verifier   = data.get("verified_by", "")
-    new_trust  = data.get("trust", "")
-
-    with event_lock:
-        if event_id not in event_log:
-            # We don't have this event yet — nothing to sync
-            return jsonify({"status": "unknown_event"}), 404
-        if verifier:
-            event_log[event_id]["cross_checks"].add(verifier)
-        if new_trust in ("LOW", "MEDIUM", "HIGH"):
-            event_log[event_id]["trust"] = new_trust
-        # Recalculate trust locally too
-        event_log[event_id]["trust"] = calculate_trust(event_id)
-
-    log.info(f"🔄 Sync: {verifier[-8:] if verifier else '?'} verified {event_id[:8]}… "
-             f"trust now={event_log[event_id]['trust']}")
-    return jsonify({"status": "ok", "trust": event_log[event_id]["trust"]})
-
-
 # ─────────────────────────────────────────────
 # Entry Point
 # ─────────────────────────────────────────────
@@ -1018,6 +1064,8 @@ if __name__ == "__main__":
     threading.Thread(target=start_discovery_announcer, daemon=True).start()
     threading.Thread(target=start_discovery_listener,  daemon=True).start()
     threading.Thread(target=start_peer_reaper,         daemon=True).start()
+    threading.Thread(target=start_tcp_keepalive,       daemon=True).start()   # NEW
+    threading.Thread(target=start_subnet_scanner,      daemon=True).start()   # NEW
 
     log.info(f"Flask API → http://0.0.0.0:{FLASK_PORT}")
     app.run(host="0.0.0.0", port=FLASK_PORT, debug=False, threaded=True)
