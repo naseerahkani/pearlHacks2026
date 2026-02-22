@@ -15,6 +15,7 @@ import threading
 import uuid
 import time
 import logging
+import difflib
 
 try:
     import netifaces
@@ -88,6 +89,93 @@ def get_my_ips() -> list:
             except Exception:
                 ips.append("127.0.0.1")
     return list(set(ips))
+
+def location_similarity(a: str, b: str) -> float:
+    """
+    Returns 0.0–1.0 similarity between two location strings.
+    Strips common filler words so "near raising canes" ~ "next to raising canes".
+    """
+    if not a or not b:
+        return 0.0
+    stopwords = {'near', 'next', 'to', 'by', 'the', 'at', 'on', 'in', 'and',
+                 'street', 'st', 'ave', 'rd', 'blvd', 'nc', 'drive', 'dr'}
+    def tokens(s):
+        return set(w.lower().strip('.,') for w in s.split() if w.lower().strip('.,') not in stopwords)
+
+    ta, tb = tokens(a), tokens(b)
+    if not ta or not tb:
+        return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+    # Jaccard similarity on meaningful tokens
+    intersection = len(ta & tb)
+    union        = len(ta | tb)
+    return intersection / union if union else 0.0
+
+
+def description_similarity(a: str, b: str) -> float:
+    """Semantic-ish similarity via token overlap on content words."""
+    if not a or not b:
+        return 0.0
+    stopwords = {'a', 'an', 'the', 'is', 'it', 'on', 'in', 'at', 'and', 'or',
+                 'of', 'to', 'are', 'was', 'be', 'have', 'has', 'there', 'they',
+                 'that', 'this', 'with', 'for', 'very', 'really', 'looks', 'like'}
+    def tokens(s):
+        return set(w.lower().strip('.,!?') for w in s.split() if w.lower().strip('.,!?') not in stopwords and len(w) > 2)
+
+    ta, tb = tokens(a), tokens(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def pre_cluster_events(events: list) -> list[list]:
+    """
+    Rule-based pre-clustering pass BEFORE Ollama.
+    Groups events that are clearly the same incident based on:
+      - Same type
+      - Location similarity > 0.35  (lenient — catches paraphrases)
+      - OR description similarity > 0.30
+
+    Returns a list of groups (each group is a list of event dicts).
+    Events that don't match anything form single-item groups.
+    """
+    n       = len(events)
+    parent  = list(range(n))   # union-find
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        parent[find(i)] = find(j)
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = events[i], events[j]
+
+            # Must be same type to pre-cluster
+            if a.get('type') != b.get('type'):
+                continue
+
+            loc_sim  = location_similarity(a.get('location', ''),  b.get('location', ''))
+            desc_sim = description_similarity(a.get('description', ''), b.get('description', ''))
+
+            # Group if locations are similar (same area, same type)
+            # OR descriptions are very similar regardless of location wording
+            if loc_sim >= 0.35 or desc_sim >= 0.30:
+                log.info(f"Pre-cluster match: {a['event_id'][:8]}… ~ {b['event_id'][:8]}… "
+                         f"(loc={loc_sim:.2f} desc={desc_sim:.2f})")
+                union(i, j)
+
+    # Collect groups
+    groups: dict[int, list] = {}
+    for i, ev in enumerate(events):
+        root = find(i)
+        groups.setdefault(root, []).append(ev)
+
+    return list(groups.values())
 
 
 def get_broadcast_addresses() -> list:
@@ -810,49 +898,63 @@ CLUSTER_CACHE_TTL = 10
 
 
 def build_cluster_prompt(events: list) -> str:
+    """
+    Build prompt for Ollama. We send pre-clustered hints so the model
+    has a head start on which events belong together.
+    """
+    # Run pre-clustering to give the model hints
+    pre_groups = pre_cluster_events(events)
+
     event_summaries = []
     for e in events:
+        # Find which pre-cluster group this event belongs to
+        group_id = next(
+            (i for i, g in enumerate(pre_groups) if any(x['event_id'] == e['event_id'] for x in g)),
+            -1
+        )
         summary = {
-            "id":          e["event_id"][:8],
-            "full_id":     e["event_id"],
-            "type":        e["type"],
-            "description": e.get("description", "") or "(no description)",
-            "location":    e.get("location",    "") or "(no location)",
-            "trust":       e["trust"],
-            "age_seconds": int(time.time() - (e["first_seen"] or time.time())),
+            "id":              e["event_id"][:8],
+            "full_id":         e["event_id"],
+            "type":            e["type"],
+            "description":     e.get("description", "") or "(no description)",
+            "location":        e.get("location",    "") or "(no location)",
+            "trust":           e["trust"],
+            "age_seconds":     int(time.time() - (e["first_seen"] or time.time())),
+            "pre_cluster_hint": group_id,   # tell the model our suggestion
         }
         event_summaries.append(summary)
 
     events_json = json.dumps(event_summaries, indent=2)
 
-    prompt = f"""You are an emergency dispatch AI clustering duplicate alert reports.
+    prompt = f"""You are an emergency dispatch AI. Your ONLY job is to group duplicate alert reports.
 
-Your job is to identify which alerts are describing THE SAME real-world incident reported by different people.
-Be AGGRESSIVE about grouping — in a real emergency, multiple people report the same thing in different words.
+CRITICAL RULE: Multiple people reporting the SAME emergency will use DIFFERENT words.
+"high-rise building" = "tall building" = "multi-story building" — these are the SAME.
+"near Raising Cane's" = "next to Raising Canes" = "by the chicken place on Hillsborough" — SAME location.
+"people trapped" = "people stuck inside" = "can't get out" — SAME situation.
 
-Two alerts belong in the same cluster if ANY of these are true:
-- Same general location (even if described differently: "near the gym" vs "by the sports complex") AND same type
-- Same type AND descriptions that could plausibly describe the same incident even if worded differently
-- One description sounds like a paraphrase or restatement of another
+GROUPING THRESHOLD: If two alerts have the same TYPE and describe something that COULD be the same
+incident, PUT THEM IN THE SAME CLUSTER. You must err on the side of grouping, not splitting.
 
-Do NOT split alerts into separate clusters just because the wording is different.
-If in doubt, GROUP THEM TOGETHER. False grouping is better than missed grouping.
+Each alert has a "pre_cluster_hint" field — this is our rule-based suggestion for which alerts
+belong together (same number = same suggested group). Follow these hints UNLESS you have a strong
+reason to believe the alerts describe genuinely different incidents.
 
 Return ONLY valid JSON — no explanation, no markdown, no code fences.
-The JSON must be an array of cluster objects, each with EXACTLY these fields:
+JSON must be an array of cluster objects, each with EXACTLY:
 - "cluster_id": integer starting from 1
-- "label": short human-readable incident label (max 8 words)
+- "label": short incident label (max 8 words)  
 - "severity": "CRITICAL", "HIGH", or "MEDIUM"
-- "type": dominant type — FIRE, MEDICAL, SECURITY, or MIXED
-- "summary": one sentence describing the incident as if writing it fresh (max 20 words)
-- "event_ids": array of full_id strings in this cluster
-- "recommended_action": brief responder action (max 10 words)
+- "type": FIRE, MEDICAL, SECURITY, or MIXED
+- "summary": one sentence synthesizing ALL reports in this cluster (max 25 words)
+- "event_ids": array of full_id strings
+- "recommended_action": brief responder instruction (max 10 words)
 
-Additional rules:
-- Every alert must appear in exactly one cluster
-- Isolated alerts with no match get their own single-alert cluster
+Rules:
+- EVERY alert must appear in exactly one cluster
+- Same pre_cluster_hint number → almost certainly the same cluster
 - FIRE > SECURITY > MEDICAL for severity when mixed
-- Base the summary on the highest-trust alert in the cluster
+- If only one alert exists, it still gets its own cluster
 
 Alerts:
 {events_json}
@@ -868,8 +970,8 @@ def call_ollama(prompt: str, timeout: int = 120) -> str | None:
         "prompt": prompt,
         "stream": False,
         "options": {
-            "temperature": 0.1,
-            "num_predict": 800,
+            "temperature": 0.05,   # even lower temp = more deterministic grouping
+            "num_predict": 1000,
         }
     }).encode("utf-8")
 
@@ -889,32 +991,38 @@ def call_ollama(prompt: str, timeout: int = 120) -> str | None:
 
 
 def fallback_clusters(events: list) -> list:
+    """
+    Rule-based fallback — uses the same pre_cluster_events logic
+    so even without Ollama, paraphrased reports get merged.
+    """
     SEVERITY = {"FIRE": "CRITICAL", "SECURITY": "HIGH", "MEDICAL": "HIGH", "UNKNOWN": "MEDIUM"}
-    groups   = {}
-    for e in events:
-        loc_key  = (e.get("location") or "")[:20].lower().strip()
-        type_key = e.get("type", "UNKNOWN")
-        key      = f"{type_key}|{loc_key}" if loc_key else type_key
-        groups.setdefault(key, []).append(e)
+    groups   = pre_cluster_events(events)   # use similarity-based grouping
 
     clusters = []
-    for i, (key, group) in enumerate(groups.items(), 1):
+    for i, group in enumerate(groups, 1):
         etype = group[0].get("type", "UNKNOWN")
         loc   = group[0].get("location", "") or "unknown location"
+        # Pick the highest-trust event's description as the label basis
+        best  = max(group, key=lambda e: {"HIGH": 3, "MEDIUM": 2, "LOW": 1}.get(e.get("trust", "LOW"), 0))
         clusters.append({
-            "cluster_id":          i,
-            "label":               f"{etype.title()} — {loc[:30]}",
-            "severity":            SEVERITY.get(etype, "MEDIUM"),
-            "type":                etype,
-            "summary":             f"{len(group)} report{'s' if len(group) > 1 else ''} of {etype.lower()} emergency near {loc[:25]}",
-            "event_ids":           [e["event_id"] for e in group],
-            "recommended_action":  "Respond immediately and assess situation",
-            "source":              "fallback",
+            "cluster_id":         i,
+            "label":              f"{etype.title()} — {loc[:35]}",
+            "severity":           SEVERITY.get(etype, "MEDIUM"),
+            "type":               etype,
+            "summary":            (best.get("description") or f"{len(group)} {etype.lower()} report(s) near {loc[:25]}")[:120],
+            "event_ids":          [e["event_id"] for e in group],
+            "recommended_action": "Respond immediately and assess situation",
+            "source":             "fallback",
         })
     return clusters
 
 
 def parse_cluster_response(raw: str, events: list) -> list:
+    """
+    Parse Ollama's JSON response. Falls back to pre_cluster-based fallback
+    if JSON is invalid. Also runs a post-pass to merge any clusters that
+    the model should have grouped but didn't.
+    """
     if not raw:
         return fallback_clusters(events)
 
@@ -925,7 +1033,7 @@ def parse_cluster_response(raw: str, events: list) -> list:
 
     match = re.search(r"\[.*\]", text, re.DOTALL)
     if not match:
-        log.warning("Ollama response had no JSON array — using fallback")
+        log.warning("Ollama: no JSON array found — using fallback")
         return fallback_clusters(events)
 
     try:
@@ -937,21 +1045,18 @@ def parse_cluster_response(raw: str, events: list) -> list:
     prefix_map = {e["event_id"][:8]: e["event_id"] for e in events}
     all_full   = {e["event_id"] for e in events}
 
-    seen_event_ids = set()
-    clean = []
+    seen_ids = set()
+    clean    = []
     for c in clusters:
         if not isinstance(c, dict):
             continue
-        raw_ids  = c.get("event_ids", [])
         full_ids = []
-        for rid in raw_ids:
-            if rid in all_full:
-                full_ids.append(rid)
-            elif rid in prefix_map:
-                full_ids.append(prefix_map[rid])
+        for rid in c.get("event_ids", []):
+            if   rid in all_full:    full_ids.append(rid)
+            elif rid in prefix_map:  full_ids.append(prefix_map[rid])
         if not full_ids:
             continue
-        seen_event_ids.update(full_ids)
+        seen_ids.update(full_ids)
         clean.append({
             "cluster_id":         c.get("cluster_id", len(clean) + 1),
             "label":              str(c.get("label", "Unknown Incident"))[:60],
@@ -963,9 +1068,51 @@ def parse_cluster_response(raw: str, events: list) -> list:
             "source":             "ollama",
         })
 
-    missed = [e for e in events if e["event_id"] not in seen_event_ids]
+    # Any events the model missed → fallback for just those
+    missed = [e for e in events if e["event_id"] not in seen_ids]
     if missed:
         clean.extend(fallback_clusters(missed))
+
+    # ── Post-pass: merge any ollama clusters that pre-clustering says should be together ──
+    # This catches cases where the model still split things it shouldn't have
+    pre_groups = pre_cluster_events(events)
+    pre_map    = {}   # event_id → pre_group_index
+    for gi, group in enumerate(pre_groups):
+        for ev in group:
+            pre_map[ev["event_id"]] = gi
+
+    merged     = True
+    iterations = 0
+    while merged and iterations < 10:
+        merged = False
+        iterations += 1
+        new_clean = []
+        used      = set()
+        for i, ca in enumerate(clean):
+            if i in used:
+                continue
+            merged_cluster = dict(ca)
+            merged_cluster["event_ids"] = list(ca["event_ids"])
+            for j, cb in enumerate(clean):
+                if j <= i or j in used:
+                    continue
+                # Check if any event pair across the two clusters should be in same pre-group
+                should_merge = any(
+                    pre_map.get(ea) == pre_map.get(eb) and pre_map.get(ea) is not None
+                    for ea in ca["event_ids"] for eb in cb["event_ids"]
+                )
+                if should_merge:
+                    log.info(f"Post-merge: cluster '{ca['label']}' + '{cb['label']}'")
+                    merged_cluster["event_ids"].extend(cb["event_ids"])
+                    # Keep higher severity
+                    sev_order = {"CRITICAL": 3, "HIGH": 2, "MEDIUM": 1}
+                    if sev_order.get(cb["severity"], 0) > sev_order.get(merged_cluster["severity"], 0):
+                        merged_cluster["severity"] = cb["severity"]
+                    used.add(j)
+                    merged = True
+            new_clean.append(merged_cluster)
+            used.add(i)
+        clean = new_clean
 
     return clean if clean else fallback_clusters(events)
 
@@ -1008,7 +1155,7 @@ def cluster_events():
     else:
         clusters = fallback_clusters(events)
         source   = "fallback"
-        log.info(f"Ollama unavailable — fallback clustering: {len(clusters)} clusters")
+        log.info(f"Fallback clustering: {len(clusters)} clusters")
 
     result = {
         "clusters":         clusters,
