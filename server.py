@@ -570,7 +570,9 @@ def verify_event(event_id: str):
     """
     Human confirms: "I can witness this emergency."
     Adds this device to cross_checks, clears pending_verify flag,
-    then re-broadcasts so all peers see the updated verification count.
+    re-broadcasts the packet AND pushes a lightweight sync to all peers
+    so their dashboards update the cross_check count without waiting for
+    the next relay cycle.
     """
     with event_lock:
         if event_id not in event_log:
@@ -580,7 +582,7 @@ def verify_event(event_id: str):
             return jsonify({"error": "Cannot verify your own alert"}), 400
 
         event_log[event_id]["cross_checks"].add(MY_DEVICE_ID)
-        event_log[event_id]["pending_verify"] = False   # ← acted on
+        event_log[event_id]["pending_verify"] = False
         event_log[event_id]["dismissed"]      = False
         event_log[event_id]["trust"]          = calculate_trust(event_id)
         new_trust       = event_log[event_id]["trust"]
@@ -590,12 +592,35 @@ def verify_event(event_id: str):
     log.info(f"✅ Manual verify: {MY_DEVICE_ID[-8:]} confirmed {event_id[:8]}… "
              f"checks={cross_count} trust={new_trust}")
 
-    # Re-broadcast so peers see the updated verification
     entry  = event_log[event_id]
     packet = dict(entry["packet"])
     packet["hop_count"] = entry["max_hop"] + 1
     packet["device_id"] = MY_DEVICE_ID
     relay_to_peers(packet, origin_event_id=event_id)
+
+    sync_payload = json.dumps({
+        "verified_by": MY_DEVICE_ID,
+        "trust":       new_trust,
+        "cross_checks": cross_count,
+    }).encode()
+
+    def push_sync():
+        for peer_ip in get_all_known_peers():
+            try:
+                import urllib.request as _ur
+                req = _ur.Request(
+                    f"http://{peer_ip}:{FLASK_PORT}/api/events/{event_id}/sync",
+                    data=sync_payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                _ur.urlopen(req, timeout=3)
+                log.debug(f"🔄 Sync pushed to {peer_ip}")
+            except Exception as e:
+                log.debug(f"Sync push failed for {peer_ip}: {e}")
+
+    # Run sync pushes in background so we don't block the response
+    threading.Thread(target=push_sync, daemon=True).start()
 
     return jsonify({
         "status":       "ok",
@@ -949,6 +974,32 @@ def emergency_contacts():
         {"name": "NC Emergency Management",      "number": "919-825-2500", "type": "state"},
         {"name": "Poison Control",               "number": "800-222-1222", "type": "medical"},
     ])
+    
+@app.route("/api/events/<event_id>/sync", methods=["POST"])
+def sync_event_verification(event_id: str):
+    """
+    Called by a peer after they verify an event, so THIS device's in-memory
+    state reflects the updated cross_checks without needing a full relay decode.
+    Body: { "verified_by": "<device_id>", "cross_checks": N, "trust": "..." }
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    verifier   = data.get("verified_by", "")
+    new_trust  = data.get("trust", "")
+
+    with event_lock:
+        if event_id not in event_log:
+            # We don't have this event yet — nothing to sync
+            return jsonify({"status": "unknown_event"}), 404
+        if verifier:
+            event_log[event_id]["cross_checks"].add(verifier)
+        if new_trust in ("LOW", "MEDIUM", "HIGH"):
+            event_log[event_id]["trust"] = new_trust
+        # Recalculate trust locally too
+        event_log[event_id]["trust"] = calculate_trust(event_id)
+
+    log.info(f"🔄 Sync: {verifier[-8:] if verifier else '?'} verified {event_id[:8]}… "
+             f"trust now={event_log[event_id]['trust']}")
+    return jsonify({"status": "ok", "trust": event_log[event_id]["trust"]})
 
 
 # ─────────────────────────────────────────────

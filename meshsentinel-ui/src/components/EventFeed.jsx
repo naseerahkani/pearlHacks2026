@@ -13,7 +13,8 @@ const TRUST_META = {
   LOW:    { color: 'var(--trust-low)',     bg: 'var(--trust-low-bg)',    border: 'var(--trust-low-border)'    },
 }
 
-const TTL_MS = 10 * 60 * 1000
+// Only fade if unverified AND older than 30 seconds
+const UNVERIFIED_TTL_MS = 30 * 1000
 
 function useElapsed(firstSeen) {
   const [elapsed, setElapsed] = useState(0)
@@ -21,7 +22,7 @@ function useElapsed(firstSeen) {
     const ts = (firstSeen || 0) * 1000
     const update = () => setElapsed(Date.now() - ts)
     update()
-    const t = setInterval(update, 5000)
+    const t = setInterval(update, 1000)
     return () => clearInterval(t)
   }, [firstSeen])
   return elapsed
@@ -56,7 +57,7 @@ function TrustProgress({ crossChecks, trust }) {
   const t  = trust || 'LOW'
   const cc = crossChecks || 0
   let pct, nextLabel, nextAt
-  if (t === 'HIGH')        { pct = 100;                           nextLabel = null;     nextAt = null }
+  if (t === 'HIGH')        { pct = 100;                            nextLabel = null;     nextAt = null }
   else if (t === 'MEDIUM') { pct = Math.min(100, (cc / 9) * 100); nextLabel = 'HIGH';   nextAt = 9    }
   else                     { pct = Math.min(100, (cc / 2) * 100); nextLabel = 'MEDIUM'; nextAt = 2    }
   const color = t === 'HIGH' ? 'var(--trust-high)' : t === 'MEDIUM' ? 'var(--trust-medium)' : 'var(--trust-low)'
@@ -79,24 +80,21 @@ function TrustProgress({ crossChecks, trust }) {
 }
 
 // ─────────────────────────────────────────────
-// Verification Panel — the core new UI element
-// State machine: idle → confirming → sending → done / error
-//                idle → dismissing → done
+// Verification Panel
 // ─────────────────────────────────────────────
 function VerificationPanel({ event, myDeviceId, onAction }) {
   const [phase, setPhase]   = useState('idle')
   const [result, setResult] = useState(null)
 
-  const eventId      = event.event_id      || ''
-  const originDevice = event.origin_device || ''
-  const checkIds     = Array.isArray(event.cross_check_ids) ? event.cross_check_ids : []
+  const eventId       = event.event_id      || ''
+  const originDevice  = event.origin_device || ''
+  const checkIds      = Array.isArray(event.cross_check_ids) ? event.cross_check_ids : []
   const pendingVerify = event.pending_verify || false
   const dismissed     = event.dismissed     || false
 
-  const isOwn        = myDeviceId && originDevice && myDeviceId === originDevice
-  const alreadyDone  = myDeviceId && checkIds.includes(myDeviceId)
+  const isOwn       = myDeviceId && originDevice && myDeviceId === originDevice
+  const alreadyDone = myDeviceId && checkIds.includes(myDeviceId)
 
-  // ── 1. You sent this — nothing to verify ──
   if (isOwn) {
     return (
       <div style={styles.vpRow}>
@@ -106,8 +104,7 @@ function VerificationPanel({ event, myDeviceId, onAction }) {
     )
   }
 
-  // ── 2. Already verified ──
-  if (alreadyDone || phase === 'done' && result?.action === 'verify') {
+  if (alreadyDone || (phase === 'done' && result?.action === 'verify')) {
     const cc = result?.cross_checks ?? (event.cross_checks || 0)
     const tr = result?.trust        ?? event.trust
     return (
@@ -123,8 +120,7 @@ function VerificationPanel({ event, myDeviceId, onAction }) {
     )
   }
 
-  // ── 3. Dismissed ──
-  if (dismissed || phase === 'done' && result?.action === 'dismiss') {
+  if (dismissed || (phase === 'done' && result?.action === 'dismiss')) {
     return (
       <div style={{ ...styles.vpRow, ...styles.vpMutedBox }}>
         <span style={{ fontSize: '13px' }}>🚫</span>
@@ -133,8 +129,6 @@ function VerificationPanel({ event, myDeviceId, onAction }) {
     )
   }
 
-  // ── 4. Not pending (relay propagated but already acted on or not from a peer) ──
-  //    Show a lighter "you can still verify manually" prompt
   if (!pendingVerify && phase === 'idle') {
     return (
       <div style={{ ...styles.vpRow, ...styles.vpMutedBox }}>
@@ -149,7 +143,6 @@ function VerificationPanel({ event, myDeviceId, onAction }) {
     )
   }
 
-  // ── 5. PENDING — needs a decision right now ──
   if (pendingVerify && phase === 'idle') {
     return (
       <div style={styles.vpPendingBox}>
@@ -161,7 +154,6 @@ function VerificationPanel({ event, myDeviceId, onAction }) {
               This alert arrived from a peer. If you can see or confirm this situation,
               tap <strong>Yes, I can confirm</strong>. Your device will be broadcast as an
               independent cross-check, raising trust for everyone in the mesh.
-              If you cannot confirm, tap <strong>No / Dismiss</strong>.
             </div>
           </div>
         </div>
@@ -177,7 +169,6 @@ function VerificationPanel({ event, myDeviceId, onAction }) {
     )
   }
 
-  // ── 6. Confirm verify ──
   if (phase === 'confirming') {
     const doVerify = async () => {
       setPhase('sending')
@@ -186,7 +177,7 @@ function VerificationPanel({ event, myDeviceId, onAction }) {
         const data = await res.json()
         setResult({ ...data, action: 'verify' })
         setPhase(res.ok ? 'done' : 'error')
-        res.ok && onAction && onAction()
+        if (res.ok) onAction && onAction()
       } catch {
         setResult({ error: 'Could not reach backend', action: 'verify' })
         setPhase('error')
@@ -207,7 +198,6 @@ function VerificationPanel({ event, myDeviceId, onAction }) {
     )
   }
 
-  // ── 7. Confirm dismiss ──
   if (phase === 'dismissing') {
     const doDismiss = async () => {
       setPhase('sending')
@@ -215,7 +205,7 @@ function VerificationPanel({ event, myDeviceId, onAction }) {
         const res = await fetch(`/api/events/${eventId}/dismiss`, { method: 'POST' })
         setResult({ action: 'dismiss' })
         setPhase(res.ok ? 'done' : 'error')
-        res.ok && onAction && onAction()
+        if (res.ok) onAction && onAction()
       } catch {
         setResult({ error: 'Could not reach backend', action: 'dismiss' })
         setPhase('error')
@@ -236,7 +226,6 @@ function VerificationPanel({ event, myDeviceId, onAction }) {
     )
   }
 
-  // ── 8. Sending ──
   if (phase === 'sending') {
     return (
       <div style={{ ...styles.vpRow, ...styles.vpMutedBox }}>
@@ -246,7 +235,6 @@ function VerificationPanel({ event, myDeviceId, onAction }) {
     )
   }
 
-  // ── 9. Error ──
   if (phase === 'error') {
     return (
       <div style={{ ...styles.vpRow, background: 'rgba(239,68,68,0.06)', border: '1px solid rgba(239,68,68,0.2)', borderRadius: '10px', padding: '10px 14px' }}>
@@ -282,19 +270,22 @@ function EventCard({ event, myDeviceId, onVerificationAction }) {
 
   const meta    = TYPE_META[type] || TYPE_META.UNKNOWN
   const elapsed = useElapsed(firstSeen)
-  const fading  = elapsed > TTL_MS
+
+  // Issue 3 fix: only fade if unverified AND past 30 second window
+  // Verified = has cross-checks, is authorized, or is HIGH trust
+  const isVerified = crossChecks > 0 || authorizedNode || trust === 'HIGH' || trust === 'MEDIUM'
+  const fading     = !isVerified && elapsed > UNVERIFIED_TTL_MS
+  const secondsLeft = isVerified ? null : Math.max(0, Math.ceil((UNVERIFIED_TTL_MS - elapsed) / 1000))
 
   return (
     <div style={{
       ...styles.card,
       borderLeft: `3px solid ${meta.color}`,
       opacity: fading ? 0.35 : 1,
-      // Pulse the border when pending verification
       boxShadow: pendingVerify ? `0 0 0 2px rgba(245,158,11,0.35)` : undefined,
       transition: 'opacity 1s ease, box-shadow 0.3s ease',
     }}>
 
-      {/* Pending banner */}
       {pendingVerify && (
         <div style={styles.pendingBanner}>
           <span>⚠️</span> This alert needs your verification
@@ -324,7 +315,6 @@ function EventCard({ event, myDeviceId, onVerificationAction }) {
         <TrustBadge trust={trust} />
       </div>
 
-      {/* Description / location */}
       {(description || location) && (
         <div style={styles.descBlock}>
           {description && <div style={styles.descText}>"{description}"</div>}
@@ -332,7 +322,6 @@ function EventCard({ event, myDeviceId, onVerificationAction }) {
         </div>
       )}
 
-      {/* Stats */}
       <div style={styles.statsRow}>
         <div style={styles.statBox}>
           <div style={styles.statNum}>{devicesReached}</div>
@@ -350,17 +339,14 @@ function EventCard({ event, myDeviceId, onVerificationAction }) {
         </div>
       </div>
 
-      {/* Trust progress */}
       {!authorizedNode && <TrustProgress crossChecks={crossChecks} trust={trust} />}
 
-      {/* ── Verification panel ── */}
       <VerificationPanel
         event={event}
         myDeviceId={myDeviceId}
         onAction={onVerificationAction}
       />
 
-      {/* Expandable device list */}
       {devicesReached > 0 && (
         <div>
           <button style={styles.expandBtn} onClick={() => setExpanded(e => !e)}>
@@ -392,7 +378,15 @@ function EventCard({ event, myDeviceId, onVerificationAction }) {
         </div>
       )}
 
-      {fading && <div style={styles.ttlNotice}>⏳ Alert expired — fading out</div>}
+      {/* Issue 3: Show countdown only for unverified, fade message when expired */}
+      {!isVerified && !fading && secondsLeft !== null && secondsLeft <= 30 && (
+        <div style={styles.ttlCountdown}>
+          ⏱ Fades in {secondsLeft}s if not verified
+        </div>
+      )}
+      {fading && (
+        <div style={styles.ttlNotice}>⏳ Unverified alert expired — awaiting confirmation</div>
+      )}
     </div>
   )
 }
@@ -404,7 +398,6 @@ export default function EventFeed({ events, myDeviceId, pendingCount, onRefresh,
   const [filter, setFilter] = useState('ALL')
   const safeEvents = Array.isArray(events) ? events : []
 
-  // Sort: pending verifications first, then by time
   const sorted = [...safeEvents].sort((a, b) => {
     if (a.pending_verify && !b.pending_verify) return -1
     if (!a.pending_verify && b.pending_verify) return 1
@@ -417,7 +410,6 @@ export default function EventFeed({ events, myDeviceId, pendingCount, onRefresh,
 
   return (
     <div style={styles.feed}>
-      {/* Toolbar */}
       <div style={styles.toolbar}>
         <div style={styles.toolbarLeft}>
           <span style={styles.feedTitle}>Live Alerts</span>
@@ -438,7 +430,6 @@ export default function EventFeed({ events, myDeviceId, pendingCount, onRefresh,
         <button onClick={onRefresh} style={styles.refreshBtn} title="Refresh">↻</button>
       </div>
 
-      {/* Cards */}
       <div style={styles.cards}>
         {filtered.length === 0 ? (
           <div style={styles.empty}>
@@ -464,9 +455,6 @@ export default function EventFeed({ events, myDeviceId, pendingCount, onRefresh,
   )
 }
 
-// ─────────────────────────────────────────────
-// Styles
-// ─────────────────────────────────────────────
 const styles = {
   feed:            { display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' },
   toolbar:         { display: 'flex', alignItems: 'center', gap: '12px', padding: '12px 20px', borderBottom: '1px solid var(--border)', background: 'var(--bg-secondary)', flexShrink: 0 },
@@ -497,29 +485,26 @@ const styles = {
   chipVerifier:    { color: 'var(--trust-medium)', borderColor: 'rgba(245,158,11,0.4)', background: 'rgba(245,158,11,0.08)' },
   chipLegend:      { width: '100%', display: 'flex', gap: '10px', marginTop: '4px', fontSize: '9px', color: 'var(--text-muted)', letterSpacing: '0.04em' },
   ttlNotice:       { fontSize: '11px', color: 'var(--text-muted)', fontStyle: 'italic' },
+  ttlCountdown:    { fontSize: '11px', color: '#f59e0b', fontStyle: 'italic', fontFamily: 'var(--mono)' },
   empty:           { flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '60px 20px', textAlign: 'center', gap: '12px' },
   emptyIcon:       { fontSize: '48px', opacity: 0.4 },
   emptyTitle:      { fontSize: '16px', fontWeight: 700, color: 'var(--text-secondary)' },
   emptyText:       { fontSize: '13px', color: 'var(--text-muted)', lineHeight: 1.6 },
 
-  // ── Verification panel styles ──
-  vpRow:          { display: 'flex', alignItems: 'flex-start', gap: '10px' },
-  vpMuted:        { fontSize: '11px', color: 'var(--text-muted)', fontStyle: 'italic' },
-  vpMutedBox:     { background: 'var(--bg-secondary)', borderRadius: '10px', padding: '10px 14px' },
-  vpIcon:         { fontSize: '13px', flexShrink: 0, marginTop: '1px' },
-  vpInlineBtn:    { background: 'none', border: 'none', padding: 0, color: 'var(--accent-blue)', fontSize: '11px', fontWeight: 600, cursor: 'pointer', fontFamily: 'var(--font)', textDecoration: 'underline' },
-
-  vpPendingBox:   { background: 'rgba(245,158,11,0.06)', border: '1px solid rgba(245,158,11,0.3)', borderRadius: '12px', padding: '14px', display: 'flex', flexDirection: 'column', gap: '12px' },
-  vpPendingHeader:{ display: 'flex', gap: '12px', alignItems: 'flex-start' },
-  vpPendingTitle: { fontSize: '13px', fontWeight: 700, color: '#f59e0b', marginBottom: '4px' },
-  vpPendingDesc:  { fontSize: '12px', color: 'var(--text-muted)', lineHeight: 1.6 },
-
-  vpConfirmBox:   { background: 'rgba(59,130,246,0.05)', border: '1px solid rgba(59,130,246,0.2)', borderRadius: '12px', padding: '14px', display: 'flex', flexDirection: 'column', gap: '10px' },
-  vpConfirmTitle: { fontSize: '13px', fontWeight: 700, color: 'var(--text-primary)' },
-  vpConfirmDesc:  { fontSize: '12px', color: 'var(--text-muted)', lineHeight: 1.6 },
-
-  vpBtnRow:       { display: 'flex', gap: '8px' },
-  vpDismissBtn:   { flex: 1, padding: '9px 14px', border: '1px solid var(--border)', borderRadius: '8px', background: 'transparent', color: 'var(--text-secondary)', fontSize: '12px', fontWeight: 600, cursor: 'pointer', fontFamily: 'var(--font)' },
-  vpVerifyBtn:    { flex: 2, padding: '9px 14px', border: 'none', borderRadius: '8px', background: 'var(--trust-medium)', color: '#000', fontSize: '12px', fontWeight: 700, cursor: 'pointer', fontFamily: 'var(--font)' },
-  vpCancelBtn:    { flex: 1, padding: '9px 14px', border: '1px solid var(--border)', borderRadius: '8px', background: 'transparent', color: 'var(--text-secondary)', fontSize: '12px', fontWeight: 600, cursor: 'pointer', fontFamily: 'var(--font)' },
+  vpRow:           { display: 'flex', alignItems: 'flex-start', gap: '10px' },
+  vpMuted:         { fontSize: '11px', color: 'var(--text-muted)', fontStyle: 'italic' },
+  vpMutedBox:      { background: 'var(--bg-secondary)', borderRadius: '10px', padding: '10px 14px' },
+  vpIcon:          { fontSize: '13px', flexShrink: 0, marginTop: '1px' },
+  vpInlineBtn:     { background: 'none', border: 'none', padding: 0, color: 'var(--accent-blue)', fontSize: '11px', fontWeight: 600, cursor: 'pointer', fontFamily: 'var(--font)', textDecoration: 'underline' },
+  vpPendingBox:    { background: 'rgba(245,158,11,0.06)', border: '1px solid rgba(245,158,11,0.3)', borderRadius: '12px', padding: '14px', display: 'flex', flexDirection: 'column', gap: '12px' },
+  vpPendingHeader: { display: 'flex', gap: '12px', alignItems: 'flex-start' },
+  vpPendingTitle:  { fontSize: '13px', fontWeight: 700, color: '#f59e0b', marginBottom: '4px' },
+  vpPendingDesc:   { fontSize: '12px', color: 'var(--text-muted)', lineHeight: 1.6 },
+  vpConfirmBox:    { background: 'rgba(59,130,246,0.05)', border: '1px solid rgba(59,130,246,0.2)', borderRadius: '12px', padding: '14px', display: 'flex', flexDirection: 'column', gap: '10px' },
+  vpConfirmTitle:  { fontSize: '13px', fontWeight: 700, color: 'var(--text-primary)' },
+  vpConfirmDesc:   { fontSize: '12px', color: 'var(--text-muted)', lineHeight: 1.6 },
+  vpBtnRow:        { display: 'flex', gap: '8px' },
+  vpDismissBtn:    { flex: 1, padding: '9px 14px', border: '1px solid var(--border)', borderRadius: '8px', background: 'transparent', color: 'var(--text-secondary)', fontSize: '12px', fontWeight: 600, cursor: 'pointer', fontFamily: 'var(--font)' },
+  vpVerifyBtn:     { flex: 2, padding: '9px 14px', border: 'none', borderRadius: '8px', background: 'var(--trust-medium)', color: '#000', fontSize: '12px', fontWeight: 700, cursor: 'pointer', fontFamily: 'var(--font)' },
+  vpCancelBtn:     { flex: 1, padding: '9px 14px', border: '1px solid var(--border)', borderRadius: '8px', background: 'transparent', color: 'var(--text-secondary)', fontSize: '12px', fontWeight: 600, cursor: 'pointer', fontFamily: 'var(--font)' },
 }
