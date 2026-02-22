@@ -3,10 +3,10 @@ MeshSentinel - Offline-First P2P Community Safety Alert System
 Backend: Flask REST API + TCP Socket Server + UDP Auto-Discovery + Hop Graph
 
 Cross-verification model:
-  - devices_reached : set of device IDs that have *received* this alert
-  - cross_checks    : set of device IDs that have *re-broadcast* (relayed) this alert
-                      i.e. independently witnessed it and passed it on
-  - Trust is based on cross_checks count (independent verifications), not receipt count
+  - devices_reached    : set of device IDs that have *received* this alert
+  - cross_checks       : set of device IDs that have *manually verified* this alert
+  - pending_verify     : set of event IDs that arrived from peers and await human decision
+  - Trust is based on cross_checks count (manual human verifications only)
 """
 
 import json
@@ -43,20 +43,21 @@ MY_DEVICE_ID = f"DEVICE-{uuid.uuid4().hex[:8].upper()}"
 
 event_log: dict = {}
 # { event_id: {
-#     packet           : original packet dict
-#     devices_reached  : set of device IDs that received this alert
-#     cross_checks     : set of device IDs that re-broadcast (verified) it
-#     authorized_node  : bool — any authorized node confirmed it
-#     trust            : "LOW" | "MEDIUM" | "HIGH"
-#     max_hop          : highest hop number seen
-#     first_seen       : unix timestamp
+#     packet              : original packet dict
+#     devices_reached     : set of device IDs that received this alert
+#     cross_checks        : set of device IDs that manually verified it
+#     pending_verify      : bool — arrived from a peer, not yet acted on by THIS device
+#     dismissed           : bool — this device explicitly said "cannot confirm"
+#     authorized_node     : bool
+#     trust               : "LOW" | "MEDIUM" | "HIGH"
+#     max_hop             : highest hop number seen
+#     first_seen          : unix timestamp
 # }}
 
 hop_log: dict = {}
-# { event_id: [ { from_device, to_device, hop, ts, from_ip, to_ip } ] }
 
-manual_peers:    list = []
-discovered_peers: dict = {}   # { ip: last_seen_timestamp }
+manual_peers:     list = []
+discovered_peers: dict = {}
 active_connections: list = []
 
 peers_lock     = threading.Lock()
@@ -131,20 +132,17 @@ def get_all_known_peers() -> list:
 
 def calculate_trust(event_id: str) -> str:
     """
-    Trust is based solely on independent cross-checks:
-    how many *different* devices have re-broadcast this alert.
-    A single device broadcasting does not count as a cross-check.
+    Trust is based solely on manual cross-checks — humans who explicitly
+    confirmed they can witness this event. Auto-relay does NOT count.
     """
     entry = event_log.get(event_id, {})
     if entry.get("authorized_node"):
         return "HIGH"
-    # cross_checks is a set of device IDs that relayed the alert
-    # exclude the original broadcaster from the cross-check count
     original = entry.get("packet", {}).get("device_id", "")
-    checks = entry.get("cross_checks", set()) - {original}
-    count = len(checks)
-    if count >= 9:  return "HIGH"
-    if count >= 2:  return "MEDIUM"
+    checks   = entry.get("cross_checks", set()) - {original}
+    count    = len(checks)
+    if count >= 9: return "HIGH"
+    if count >= 2: return "MEDIUM"
     return "LOW"
 
 # ─────────────────────────────────────────────
@@ -175,70 +173,59 @@ def handle_packet(packet: dict, relay: bool = True, received_from_ip: str = ""):
     """
     Process an incoming alert packet.
 
-    relay=True  + received_from_ip=""  → originated here (UI broadcast button)
-                                          Always send to peers. Not a cross-check.
-    relay=True  + received_from_ip set → arrived via TCP from a peer.
-                                          Send to peers (mesh relay). IS a cross-check.
-    relay=False                         → internal only, no forwarding.
+    Originating device (received_from_ip == ""):
+      - Stores the event, sets pending_verify=False (you sent it, nothing to verify)
+      - Relays to all peers
 
-    devices_reached: every machine that receives the alert.  Measures spread.
-    cross_checks:    machines that re-broadcast it (excluding original sender). Measures trust.
+    Receiving device (received_from_ip set):
+      - Stores the event, sets pending_verify=True  ← awaits human YES/NO
+      - Relays to all peers (propagation continues regardless of human decision)
+      - Does NOT auto-add to cross_checks
+
+    Duplicate event_id:
+      - Skips storage (already seen)
+      - Does NOT re-relay (prevents loops)
     """
     eid = packet.get("event_id")
     if not eid:
         return
 
-    sender_device   = packet.get("device_id", "UNKNOWN")
-    hop_num         = packet.get("hop_count", 0)
-    my_device       = MY_DEVICE_ID
-    my_ip           = get_my_ips()[0] if get_my_ips() else ""
-    from_peer       = bool(received_from_ip)   # True only when received over TCP from another machine
+    sender_device = packet.get("device_id", "UNKNOWN")
+    hop_num       = packet.get("hop_count", 0)
+    my_device     = MY_DEVICE_ID
+    my_ip         = get_my_ips()[0] if get_my_ips() else ""
+    from_peer     = bool(received_from_ip)
 
-    # Record relay graph edge: sender → this machine (only for incoming peer packets)
     if from_peer:
         record_hop(eid, sender_device, my_device, hop_num,
                    from_ip=received_from_ip, to_ip=my_ip)
 
     with event_lock:
-        is_new = eid not in event_log
-        if is_new:
-            event_log[eid] = {
-                "packet":          packet,
-                "devices_reached": set(),
-                "cross_checks":    set(),
-                "authorized_node": bool(packet.get("is_authorized_node")),
-                "trust":           "LOW",
-                "max_hop":         0,
-                "first_seen":      time.time(),
-            }
-            log.info(f"New event {eid[:8]}… type={packet.get('type')} description='{packet.get('description','')}'")
-        else:
-            # Already seen this event_id — ignore duplicate relays to prevent loops
-            # but still update cross_checks if this is a new peer relaying it
-            if from_peer:
-                event_log[eid]["cross_checks"].add(sender_device)
-                event_log[eid]["trust"] = calculate_trust(eid)
-            return  # ← stop here, don't re-relay duplicates
+        if eid in event_log:
+            # Duplicate — just update sender tracking, do NOT re-relay
+            event_log[eid]["devices_reached"].add(sender_device)
+            return
 
-        entry = event_log[eid]
-        entry["devices_reached"].add(my_device)
-        entry["devices_reached"].add(sender_device)
-        entry["max_hop"] = max(entry["max_hop"], hop_num)
-
+        # New event — store it
+        event_log[eid] = {
+            "packet":          packet,
+            "devices_reached": {my_device, sender_device},
+            "cross_checks":    set(),
+            "pending_verify":  from_peer,   # True = needs human decision on this device
+            "dismissed":       False,
+            "authorized_node": bool(packet.get("is_authorized_node")),
+            "trust":           "LOW",
+            "max_hop":         hop_num,
+            "first_seen":      time.time(),
+        }
         if packet.get("is_authorized_node"):
-            entry["authorized_node"] = True
+            event_log[eid]["authorized_node"] = True
+        event_log[eid]["trust"] = calculate_trust(eid)
+        log.info(f"{'📥 Received' if from_peer else '📤 Originated'} event {eid[:8]}… "
+                 f"type={packet.get('type')} pending_verify={from_peer}")
 
-        entry["trust"] = calculate_trust(eid)
-
-    # Relay outward to all known peers
+    # Always relay new events onward (mesh propagation is independent of verification)
     if relay:
-        # If this packet came from a peer (not from our own UI), we are a cross-check
-        if from_peer:
-            with event_lock:
-                event_log[eid]["cross_checks"].add(my_device)
-                event_log[eid]["trust"] = calculate_trust(eid)
-            log.info(f"✓ Cross-check: {my_device[-8:]} verified event {eid[:8]}…")
-
         augmented = dict(packet)
         augmented["hop_count"] = hop_num + 1
         augmented["device_id"] = my_device
@@ -293,10 +280,9 @@ def start_socket_server():
 
 
 def relay_to_peers(packet: dict, origin_event_id: str = ""):
-    data = (json.dumps(packet) + "\n").encode()
+    data      = (json.dumps(packet) + "\n").encode()
     my_device = MY_DEVICE_ID
     hop_num   = packet.get("hop_count", 0)
-
     for peer_ip in get_all_known_peers():
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -304,7 +290,6 @@ def relay_to_peers(packet: dict, origin_event_id: str = ""):
             s.connect((peer_ip, SOCKET_PORT))
             s.sendall(data)
             s.close()
-            # Record outgoing graph edge
             if origin_event_id:
                 record_hop(origin_event_id, my_device, f"PEER@{peer_ip}",
                            hop_num,
@@ -340,8 +325,8 @@ def start_discovery_announcer():
             for bcast in get_broadcast_addresses():
                 try:
                     sock.sendto(payload, (bcast, DISCOVERY_PORT))
-                except Exception as e:
-                    log.debug(f"Announce to {bcast} failed: {e}")
+                except Exception:
+                    pass
         except Exception as e:
             log.warning(f"Announcer error: {e}")
         time.sleep(DISCOVERY_INTERVAL)
@@ -357,13 +342,11 @@ def start_discovery_listener():
     sock.bind(("0.0.0.0", DISCOVERY_PORT))
     sock.settimeout(5)
     log.info(f"UDP listener on port {DISCOVERY_PORT}")
-
     while True:
         try:
             data, addr = sock.recvfrom(2048)
             peer_ip = addr[0]
-            my_ips  = set(get_my_ips())
-            if peer_ip in my_ips:
+            if peer_ip in set(get_my_ips()):
                 continue
             if not data.startswith(DISCOVERY_MAGIC):
                 continue
@@ -401,30 +384,30 @@ app = Flask(__name__)
 CORS(app)
 
 
-def serialize_event(eid: str) -> dict:
+def serialize_event(eid: str, include_pending: bool = True) -> dict:
     entry = event_log[eid]
     p     = entry["packet"]
-    original = p.get("device_id", "")
-    # cross_checks excludes the original broadcaster
+    original        = p.get("device_id", "")
     verified_checks = entry["cross_checks"] - {original}
     return {
-        "event_id":           eid,
-        "type":               p.get("type", "UNKNOWN"),
-        "timestamp":          p.get("timestamp", 0),
-        "origin_device":      original,
-        "max_hop":            entry["max_hop"],
-        # How many unique devices have received this alert
-        "devices_reached":    len(entry["devices_reached"]),
+        "event_id":            eid,
+        "type":                p.get("type", "UNKNOWN"),
+        "timestamp":           p.get("timestamp", 0),
+        "origin_device":       original,
+        "max_hop":             entry["max_hop"],
+        "devices_reached":     len(entry["devices_reached"]),
         "devices_reached_ids": list(entry["devices_reached"]),
-        # How many devices independently re-broadcast it (verified it)
-        "cross_checks":       len(verified_checks),
-        "cross_check_ids":    list(verified_checks),
-        "trust":              entry["trust"],
-        "authorized_node":    entry["authorized_node"],
-        "first_seen":         entry["first_seen"],
-        "is_authorized_node": p.get("is_authorized_node", False),
-        "description":        p.get("description", ""),
-        "location":           p.get("location", ""),
+        "cross_checks":        len(verified_checks),
+        "cross_check_ids":     list(verified_checks),
+        "trust":               entry["trust"],
+        "authorized_node":     entry["authorized_node"],
+        "first_seen":          entry["first_seen"],
+        "is_authorized_node":  p.get("is_authorized_node", False),
+        "description":         p.get("description", ""),
+        "location":            p.get("location", ""),
+        # These two fields tell the UI what action state this device is in
+        "pending_verify":      entry.get("pending_verify", False),
+        "dismissed":           entry.get("dismissed", False),
     }
 
 
@@ -436,6 +419,23 @@ def get_events():
     return jsonify(events)
 
 
+@app.route("/api/pending-verifications", methods=["GET"])
+def get_pending_verifications():
+    """
+    Returns events that arrived from a peer and have not yet been acted on
+    by the human at THIS device (neither verified nor dismissed).
+    The UI polls this endpoint to drive the verification prompt.
+    """
+    with event_lock:
+        pending = [
+            serialize_event(eid)
+            for eid, entry in event_log.items()
+            if entry.get("pending_verify") and not entry.get("dismissed")
+        ]
+    pending.sort(key=lambda e: e["first_seen"])  # oldest first
+    return jsonify({"count": len(pending), "events": pending})
+
+
 @app.route("/api/broadcast", methods=["POST"])
 def broadcast():
     data = request.get_json(force=True)
@@ -443,14 +443,14 @@ def broadcast():
         if field not in data:
             return jsonify({"error": f"Missing field: {field}"}), 400
     packet = {
-        "event_id":            data["event_id"],
-        "type":                data["type"],
-        "timestamp":           data.get("timestamp", int(time.time())),
-        "device_id":           data["device_id"],
-        "hop_count":           0,
-        "is_authorized_node":  data.get("is_authorized_node", False),
-        "description":         data.get("description", "").strip()[:280],
-        "location":            data.get("location", "").strip()[:100],
+        "event_id":           data["event_id"],
+        "type":               data["type"],
+        "timestamp":          data.get("timestamp", int(time.time())),
+        "device_id":          data["device_id"],
+        "hop_count":          0,
+        "is_authorized_node": data.get("is_authorized_node", False),
+        "description":        data.get("description", "").strip()[:280],
+        "location":           data.get("location", "").strip()[:100],
     }
     handle_packet(packet, relay=True)
     return jsonify({"status": "ok", "event_id": packet["event_id"]})
@@ -506,13 +506,12 @@ def get_device():
 @app.route("/api/hops", methods=["GET"])
 def get_hops():
     filter_eid = request.args.get("event_id", None)
-    node_set   = {}
-    edges      = []
+    node_set, edges = {}, []
 
-    def clean_label(device_id: str) -> str:
-        if device_id.startswith("PEER@"):  return device_id[5:]
-        if device_id.startswith("DEVICE-"): return device_id[7:]
-        return device_id[:10]
+    def clean_label(did):
+        if did.startswith("PEER@"):   return did[5:]
+        if did.startswith("DEVICE-"): return did[7:]
+        return did[:10]
 
     with hop_lock:
         items = [(filter_eid, hop_log[filter_eid])] \
@@ -524,12 +523,12 @@ def get_hops():
                 for did in [fd, td]:
                     if did not in node_set:
                         node_set[did] = {
-                            "id":      did,
-                            "label":   clean_label(did),
+                            "id": did, "label": clean_label(did),
                             "is_self": did == MY_DEVICE_ID,
-                            "ip":      h.get("from_ip","") if did==fd else h.get("to_ip",""),
+                            "ip": h.get("from_ip","") if did==fd else h.get("to_ip",""),
                         }
-                edges.append({"from": fd, "to": td, "hop": h["hop"], "ts": h["ts"], "event_id": eid})
+                edges.append({"from": fd, "to": td, "hop": h["hop"],
+                              "ts": h["ts"], "event_id": eid})
 
     with event_lock:
         events_meta = {}
@@ -539,10 +538,10 @@ def get_hops():
                 original = e["packet"].get("device_id","")
                 verified = e["cross_checks"] - {original}
                 events_meta[eid] = {
-                    "type":            e["packet"].get("type","UNKNOWN"),
-                    "trust":           e["trust"],
+                    "type": e["packet"].get("type","UNKNOWN"),
+                    "trust": e["trust"],
                     "devices_reached": len(e["devices_reached"]),
-                    "cross_checks":    len(verified),
+                    "cross_checks": len(verified),
                 }
 
     now = time.time()
@@ -551,7 +550,8 @@ def get_hops():
             if now - ts < PEER_TIMEOUT:
                 fid = f"PEER@{ip}"
                 if fid not in node_set:
-                    node_set[fid] = {"id": fid, "label": ip, "is_self": False, "ip": ip, "online": True}
+                    node_set[fid] = {"id": fid, "label": ip,
+                                     "is_self": False, "ip": ip, "online": True}
 
     if MY_DEVICE_ID not in node_set:
         my_ip = get_my_ips()[0] if get_my_ips() else ""
@@ -565,54 +565,367 @@ def get_hops():
                     "events": events_meta, "self_id": MY_DEVICE_ID})
 
 
+@app.route("/api/events/<event_id>/verify", methods=["POST"])
+def verify_event(event_id: str):
+    """
+    Human confirms: "I can witness this emergency."
+    Adds this device to cross_checks, clears pending_verify flag,
+    then re-broadcasts so all peers see the updated verification count.
+    """
+    with event_lock:
+        if event_id not in event_log:
+            return jsonify({"error": "Event not found"}), 404
+        original = event_log[event_id]["packet"].get("device_id", "")
+        if MY_DEVICE_ID == original:
+            return jsonify({"error": "Cannot verify your own alert"}), 400
+
+        event_log[event_id]["cross_checks"].add(MY_DEVICE_ID)
+        event_log[event_id]["pending_verify"] = False   # ← acted on
+        event_log[event_id]["dismissed"]      = False
+        event_log[event_id]["trust"]          = calculate_trust(event_id)
+        new_trust       = event_log[event_id]["trust"]
+        verified_checks = event_log[event_id]["cross_checks"] - {original}
+        cross_count     = len(verified_checks)
+
+    log.info(f"✅ Manual verify: {MY_DEVICE_ID[-8:]} confirmed {event_id[:8]}… "
+             f"checks={cross_count} trust={new_trust}")
+
+    # Re-broadcast so peers see the updated verification
+    entry  = event_log[event_id]
+    packet = dict(entry["packet"])
+    packet["hop_count"] = entry["max_hop"] + 1
+    packet["device_id"] = MY_DEVICE_ID
+    relay_to_peers(packet, origin_event_id=event_id)
+
+    return jsonify({
+        "status":       "ok",
+        "verified_by":  MY_DEVICE_ID,
+        "cross_checks": cross_count,
+        "trust":        new_trust,
+    })
+
+
+@app.route("/api/events/<event_id>/dismiss", methods=["POST"])
+def dismiss_event(event_id: str):
+    """
+    Human says: "I cannot confirm this — dismiss the verification prompt."
+    The alert stays visible in the feed, but this device won't be asked again.
+    Does NOT add to cross_checks, does NOT relay anything.
+    """
+    with event_lock:
+        if event_id not in event_log:
+            return jsonify({"error": "Event not found"}), 404
+        event_log[event_id]["pending_verify"] = False
+        event_log[event_id]["dismissed"]      = True
+
+    log.info(f"🚫 Dismissed: {MY_DEVICE_ID[-8:]} cannot confirm {event_id[:8]}…")
+    return jsonify({"status": "ok"})
+
+
+# ─────────────────────────────────────────────
+# Ollama Clustering
+# ─────────────────────────────────────────────
+
+# Only ONE machine on the network needs Ollama installed (the hotspot host).
+# Other machines point OLLAMA_HOST to that machine's IP, e.g. "192.168.137.1"
+# Set via environment variable: OLLAMA_HOST=192.168.137.1 python server.py
+# Defaults to localhost so the host machine works out of the box.
+import os
+import re
+import urllib.request
+
+OLLAMA_HOST  = os.environ.get("OLLAMA_HOST", "127.0.0.1")
+OLLAMA_PORT  = int(os.environ.get("OLLAMA_PORT", "11434"))
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:1b")
+OLLAMA_URL   = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/generate"
+
+# Cache: store last cluster result so UI can re-poll cheaply
+_cluster_cache: dict = {"result": None, "computed_at": 0, "event_ids": []}
+_cluster_lock = threading.Lock()
+CLUSTER_CACHE_TTL = 10  # seconds before we recompute
+
+
+def build_cluster_prompt(events: list) -> str:
+    """
+    Build a tight prompt that tells the model exactly what JSON shape to return.
+    We include only the fields that matter for clustering: type, description, location, timestamp.
+    """
+    event_summaries = []
+    for e in events:
+        summary = {
+            "id":          e["event_id"][:8],   # short ID to save tokens
+            "full_id":     e["event_id"],
+            "type":        e["type"],
+            "description": e.get("description", "") or "(no description)",
+            "location":    e.get("location",    "") or "(no location)",
+            "trust":       e["trust"],
+            "age_seconds": int(time.time() - (e["first_seen"] or time.time())),
+        }
+        event_summaries.append(summary)
+
+    events_json = json.dumps(event_summaries, indent=2)
+
+    prompt = f"""You are an emergency dispatch AI. Group the following alerts into clusters where each cluster represents the SAME real-world incident.
+
+Two alerts belong in the same cluster if they share a similar location AND a similar emergency type AND could plausibly be reports of the same event.
+
+Return ONLY valid JSON, no explanation, no markdown, no code fences. The JSON must be an array of cluster objects.
+
+Each cluster object has exactly these fields:
+- "cluster_id": integer starting from 1
+- "label": short human-readable label for this incident (max 8 words)
+- "severity": "CRITICAL", "HIGH", or "MEDIUM" based on type and trust level
+- "type": the dominant emergency type (FIRE, MEDICAL, SECURITY, or MIXED)
+- "summary": one sentence describing the incident (max 20 words)
+- "event_ids": array of full_id strings that belong to this cluster
+- "recommended_action": brief action for responders (max 10 words)
+
+Rules:
+- Every alert must appear in exactly one cluster
+- If an alert has no similar partner, it gets its own single-alert cluster
+- FIRE > SECURITY > MEDICAL for severity if types are mixed
+- Higher trust alerts should anchor the label and summary
+
+Alerts to cluster:
+{events_json}
+
+Return only the JSON array:"""
+
+    return prompt
+
+
+def call_ollama(prompt: str, timeout: int = 30) -> str | None:
+    """
+    Call Ollama's /api/generate endpoint with stream=False.
+    Returns the response text or None on failure.
+    """
+    payload = json.dumps({
+        "model":  OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.1,   # low temp = more deterministic JSON
+            "num_predict": 800,   # enough for ~10 clusters
+        }
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        OLLAMA_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data   = json.loads(resp.read().decode("utf-8"))
+            return data.get("response", "")
+    except Exception as e:
+        log.warning(f"Ollama call failed: {e}")
+        return None
+
+
+def fallback_clusters(events: list) -> list:
+    """
+    Rule-based fallback when Ollama is unavailable.
+    Groups by (type, location prefix) — simple but useful.
+    """
+    SEVERITY = {"FIRE": "CRITICAL", "SECURITY": "HIGH", "MEDICAL": "HIGH", "UNKNOWN": "MEDIUM"}
+    groups   = {}
+    for e in events:
+        loc_key  = (e.get("location") or "")[:20].lower().strip()
+        type_key = e.get("type", "UNKNOWN")
+        key      = f"{type_key}|{loc_key}" if loc_key else type_key
+        groups.setdefault(key, []).append(e)
+
+    clusters = []
+    for i, (key, group) in enumerate(groups.items(), 1):
+        etype = group[0].get("type", "UNKNOWN")
+        loc   = group[0].get("location", "") or "unknown location"
+        clusters.append({
+            "cluster_id":          i,
+            "label":               f"{etype.title()} — {loc[:30]}",
+            "severity":            SEVERITY.get(etype, "MEDIUM"),
+            "type":                etype,
+            "summary":             f"{len(group)} report{'s' if len(group) > 1 else ''} of {etype.lower()} emergency near {loc[:25]}",
+            "event_ids":           [e["event_id"] for e in group],
+            "recommended_action":  "Respond immediately and assess situation",
+            "source":              "fallback",
+        })
+    return clusters
+
+
+def parse_cluster_response(raw: str, events: list) -> list:
+    """
+    Parse the model's JSON response. Very defensive — handles:
+    - Extra whitespace / newlines
+    - Markdown code fences (```json ... ```)
+    - Partial event_ids (8-char prefixes vs full UUIDs)
+    Falls back to fallback_clusters() if JSON is invalid.
+    """
+    if not raw:
+        return fallback_clusters(events)
+
+    # Strip markdown fences if present
+    text = raw.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$",          "", text)
+    text = text.strip()
+
+    # Find the JSON array (ignore any leading/trailing prose)
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    if not match:
+        log.warning("Ollama response had no JSON array — using fallback")
+        return fallback_clusters(events)
+
+    try:
+        clusters = json.loads(match.group())
+    except json.JSONDecodeError as e:
+        log.warning(f"Ollama JSON parse error: {e} — using fallback")
+        return fallback_clusters(events)
+
+    # Build a map from 8-char prefix → full event_id for matching
+    prefix_map = {e["event_id"][:8]: e["event_id"] for e in events}
+    all_full   = {e["event_id"] for e in events}
+
+    # Normalise clusters — expand short IDs, validate structure
+    seen_event_ids = set()
+    clean = []
+    for c in clusters:
+        if not isinstance(c, dict):
+            continue
+        raw_ids = c.get("event_ids", [])
+        full_ids = []
+        for rid in raw_ids:
+            if rid in all_full:
+                full_ids.append(rid)
+            elif rid in prefix_map:
+                full_ids.append(prefix_map[rid])
+        if not full_ids:
+            continue
+        seen_event_ids.update(full_ids)
+        clean.append({
+            "cluster_id":         c.get("cluster_id", len(clean) + 1),
+            "label":              str(c.get("label", "Unknown Incident"))[:60],
+            "severity":           c.get("severity", "MEDIUM"),
+            "type":               c.get("type", "UNKNOWN"),
+            "summary":            str(c.get("summary", ""))[:120],
+            "event_ids":          full_ids,
+            "recommended_action": str(c.get("recommended_action", ""))[:80],
+            "source":             "ollama",
+        })
+
+    # Any events the model missed → own cluster
+    missed = [e for e in events if e["event_id"] not in seen_event_ids]
+    if missed:
+        clean.extend(fallback_clusters(missed))
+
+    return clean if clean else fallback_clusters(events)
+
+
+@app.route("/api/cluster", methods=["POST"])
+def cluster_events():
+    """
+    Trigger Ollama clustering of all current events.
+    Returns cached result if events haven't changed and cache is fresh.
+
+    POST body (optional): { "force": true }  — bypass cache
+    """
+    body  = request.get_json(force=True, silent=True) or {}
+    force = body.get("force", False)
+
+    with event_lock:
+        events = [serialize_event(eid) for eid in event_log]
+
+    if not events:
+        return jsonify({"clusters": [], "event_count": 0, "source": "empty", "ollama_available": False})
+
+    current_ids = sorted(e["event_id"] for e in events)
+
+    # Return cache if still fresh and events haven't changed
+    with _cluster_lock:
+        cache = _cluster_cache
+        if (not force
+                and cache["result"] is not None
+                and time.time() - cache["computed_at"] < CLUSTER_CACHE_TTL
+                and cache["event_ids"] == current_ids):
+            return jsonify({**cache["result"], "cached": True})
+
+    # Check Ollama availability first
+    try:
+        check = urllib.request.urlopen(
+            f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/tags", timeout=2
+        )
+        ollama_available = check.status == 200
+    except Exception:
+        ollama_available = False
+
+    if ollama_available:
+        prompt   = build_cluster_prompt(events)
+        raw_resp = call_ollama(prompt, timeout=30)
+        clusters = parse_cluster_response(raw_resp, events)
+        source   = "ollama"
+        log.info(f"Ollama clustering: {len(events)} events → {len(clusters)} clusters")
+    else:
+        clusters = fallback_clusters(events)
+        source   = "fallback"
+        log.info(f"Ollama unavailable — fallback clustering: {len(clusters)} clusters")
+
+    result = {
+        "clusters":         clusters,
+        "event_count":      len(events),
+        "cluster_count":    len(clusters),
+        "source":           source,
+        "ollama_available": ollama_available,
+        "ollama_host":      OLLAMA_HOST,
+        "computed_at":      time.time(),
+        "cached":           False,
+    }
+
+    with _cluster_lock:
+        _cluster_cache["result"]      = result
+        _cluster_cache["computed_at"] = time.time()
+        _cluster_cache["event_ids"]   = current_ids
+
+    return jsonify(result)
+
+
+@app.route("/api/cluster/status", methods=["GET"])
+def cluster_status():
+    """Quick check: is Ollama reachable and which model is loaded?"""
+    try:
+        resp = urllib.request.urlopen(
+            f"http://{OLLAMA_HOST}:{OLLAMA_PORT}/api/tags", timeout=2
+        )
+        data   = json.loads(resp.read().decode())
+        models = [m["name"] for m in data.get("models", [])]
+        return jsonify({
+            "available":   True,
+            "host":        OLLAMA_HOST,
+            "port":        OLLAMA_PORT,
+            "model":       OLLAMA_MODEL,
+            "model_ready": any(OLLAMA_MODEL in m for m in models),
+            "all_models":  models,
+        })
+    except Exception as e:
+        return jsonify({
+            "available":   False,
+            "host":        OLLAMA_HOST,
+            "port":        OLLAMA_PORT,
+            "model":       OLLAMA_MODEL,
+            "model_ready": False,
+            "error":       str(e),
+        })
+
+
 @app.route("/api/events/<event_id>/authorize", methods=["POST"])
 def authorize_event(event_id: str):
     with event_lock:
         if event_id not in event_log:
             return jsonify({"error": "Event not found"}), 404
         event_log[event_id]["authorized_node"] = True
-        event_log[event_id]["trust"] = "HIGH"
+        event_log[event_id]["pending_verify"]  = False
+        event_log[event_id]["trust"]           = "HIGH"
     return jsonify({"status": "ok", "trust": "HIGH"})
-
-
-@app.route("/api/events/<event_id>/verify", methods=["POST"])
-def verify_event(event_id: str):
-    """
-    Manual cross-check: the current device explicitly confirms they can witness
-    this event and want to add their verification. This is separate from the
-    automatic relay-based cross-check — this is a deliberate human action.
-    """
-    with event_lock:
-        if event_id not in event_log:
-            return jsonify({"error": "Event not found"}), 404
-
-        original = event_log[event_id]["packet"].get("device_id", "")
-
-        # Don't let the original broadcaster verify their own alert
-        if MY_DEVICE_ID == original:
-            return jsonify({"error": "Cannot verify your own alert"}), 400
-
-        # Add this device as a cross-check
-        event_log[event_id]["cross_checks"].add(MY_DEVICE_ID)
-        event_log[event_id]["trust"] = calculate_trust(event_id)
-        new_trust = event_log[event_id]["trust"]
-        cross_check_count = len(event_log[event_id]["cross_checks"] - {original})
-
-    log.info(f"Manual verify: {MY_DEVICE_ID[-8:]} confirmed event {event_id[:8]}… trust={new_trust}")
-
-    # Also relay the alert onward with our verification attached
-    entry  = event_log[event_id]
-    packet = dict(entry["packet"])
-    packet["hop_count"]  = entry["packet"].get("hop_count", 0) + 1
-    packet["device_id"]  = MY_DEVICE_ID
-    relay_to_peers(packet, origin_event_id=event_id)
-
-    return jsonify({
-        "status":            "ok",
-        "verified_by":       MY_DEVICE_ID,
-        "cross_checks":      cross_check_count,
-        "trust":             new_trust,
-    })
 
 
 @app.route("/api/events", methods=["DELETE"])
@@ -627,14 +940,14 @@ def clear_events():
 @app.route("/api/emergency-contacts", methods=["GET"])
 def emergency_contacts():
     return jsonify([
-        {"name": "UNC Campus Police",          "number": "919-962-8100", "type": "police"},
-        {"name": "Chapel Hill Police Dispatch", "number": "919-968-2760", "type": "police"},
-        {"name": "UNC Health ER",               "number": "919-966-4131", "type": "medical"},
-        {"name": "Chapel Hill Fire Dept",       "number": "919-968-2784", "type": "fire"},
-        {"name": "Orange County 911",           "number": "911",          "type": "emergency"},
-        {"name": "Duke Energy Outage Line",     "number": "800-769-3766", "type": "utility"},
-        {"name": "NC Emergency Management",     "number": "919-825-2500", "type": "state"},
-        {"name": "Poison Control",              "number": "800-222-1222", "type": "medical"},
+        {"name": "UNC Campus Police",           "number": "919-962-8100", "type": "police"},
+        {"name": "Chapel Hill Police Dispatch",  "number": "919-968-2760", "type": "police"},
+        {"name": "UNC Health ER",                "number": "919-966-4131", "type": "medical"},
+        {"name": "Chapel Hill Fire Dept",        "number": "919-968-2784", "type": "fire"},
+        {"name": "Orange County 911",            "number": "911",          "type": "emergency"},
+        {"name": "Duke Energy Outage Line",      "number": "800-769-3766", "type": "utility"},
+        {"name": "NC Emergency Management",      "number": "919-825-2500", "type": "state"},
+        {"name": "Poison Control",               "number": "800-222-1222", "type": "medical"},
     ])
 
 
