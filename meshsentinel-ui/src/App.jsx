@@ -31,9 +31,10 @@ function TabBar({ active, onChange }) {
 }
 
 function App() {
-  const [tab, setTab]         = useState('feed')
-  const [events, setEvents]   = useState([])
-  const [peers, setPeers]     = useState({
+  const [tab, setTab]               = useState('feed')
+  const [events, setEvents]         = useState([])
+  const [myDeviceId, setMyDeviceId] = useState('')   // reactive — used in EventFeed
+  const [peers, setPeers]           = useState({
     active_connections: 0,
     known_peers: [],
     discovered_peers: [],
@@ -43,15 +44,19 @@ function App() {
   })
   const [toasts, setToasts]           = useState([])
   const [showPeerMgr, setShowPeerMgr] = useState(false)
-  const deviceIdRef  = useRef(null)
   const prevEventIds = useRef(new Set())
 
   useEffect(() => {
     fetch('/api/device')
       .then(r => r.json())
-      .then(d => { if (d && d.device_id) deviceIdRef.current = d.device_id })
+      .then(d => {
+        if (d && d.device_id) {
+          setMyDeviceId(d.device_id)   // triggers re-render → EventFeed gets real ID
+        }
+      })
       .catch(() => {
-        deviceIdRef.current = 'DEVICE-' + Math.random().toString(36).slice(2, 10).toUpperCase()
+        const fallback = 'DEVICE-' + Math.random().toString(36).slice(2, 10).toUpperCase()
+        setMyDeviceId(fallback)
       })
   }, [])
 
@@ -66,7 +71,7 @@ function App() {
       const res = await fetch('/api/events')
       if (!res.ok) return
       const data = await res.json()
-      if (!Array.isArray(data)) return   // guard: reject if backend returns error object
+      if (!Array.isArray(data)) return
       setEvents(data)
       const newIds = new Set(data.map(e => e.event_id))
       data.forEach(e => {
@@ -97,11 +102,10 @@ function App() {
   }, [pollEvents, pollPeers])
 
   const handleBroadcast = async (type, isAuthorized = false, description = '', location = '') => {
-    const deviceId = deviceIdRef.current || 'DEVICE-UNKNOWN'
-    const payload  = {
+    const payload = {
       event_id:           crypto.randomUUID(),
       type,
-      device_id:          deviceId,
+      device_id:          myDeviceId || 'DEVICE-UNKNOWN',
       timestamp:          Math.floor(Date.now() / 1000),
       is_authorized_node: isAuthorized,
       description:        description || '',
@@ -128,7 +132,7 @@ function App() {
   return (
     <div style={styles.root}>
       <Header
-        deviceId={peers.device_id || ''}
+        deviceId={myDeviceId || peers.device_id || ''}
         connectedPeers={peers.active_connections || 0}
         eventCount={events.length}
         onOpenPeerMgr={() => setShowPeerMgr(true)}
@@ -139,7 +143,11 @@ function App() {
           <TabBar active={tab} onChange={setTab} />
           <div style={styles.tabContent}>
             <div style={{ ...styles.panel, display: tab === 'feed'  ? 'flex' : 'none' }}>
-              <EventFeed events={events} onRefresh={pollEvents} />
+              <EventFeed
+                events={events}
+                myDeviceId={myDeviceId}
+                onRefresh={pollEvents}
+              />
             </div>
             <div style={{ ...styles.panel, display: tab === 'graph' ? 'flex' : 'none' }}>
               <NetworkGraph />

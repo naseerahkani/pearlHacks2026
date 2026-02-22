@@ -575,6 +575,46 @@ def authorize_event(event_id: str):
     return jsonify({"status": "ok", "trust": "HIGH"})
 
 
+@app.route("/api/events/<event_id>/verify", methods=["POST"])
+def verify_event(event_id: str):
+    """
+    Manual cross-check: the current device explicitly confirms they can witness
+    this event and want to add their verification. This is separate from the
+    automatic relay-based cross-check — this is a deliberate human action.
+    """
+    with event_lock:
+        if event_id not in event_log:
+            return jsonify({"error": "Event not found"}), 404
+
+        original = event_log[event_id]["packet"].get("device_id", "")
+
+        # Don't let the original broadcaster verify their own alert
+        if MY_DEVICE_ID == original:
+            return jsonify({"error": "Cannot verify your own alert"}), 400
+
+        # Add this device as a cross-check
+        event_log[event_id]["cross_checks"].add(MY_DEVICE_ID)
+        event_log[event_id]["trust"] = calculate_trust(event_id)
+        new_trust = event_log[event_id]["trust"]
+        cross_check_count = len(event_log[event_id]["cross_checks"] - {original})
+
+    log.info(f"Manual verify: {MY_DEVICE_ID[-8:]} confirmed event {event_id[:8]}… trust={new_trust}")
+
+    # Also relay the alert onward with our verification attached
+    entry  = event_log[event_id]
+    packet = dict(entry["packet"])
+    packet["hop_count"]  = entry["packet"].get("hop_count", 0) + 1
+    packet["device_id"]  = MY_DEVICE_ID
+    relay_to_peers(packet, origin_event_id=event_id)
+
+    return jsonify({
+        "status":            "ok",
+        "verified_by":       MY_DEVICE_ID,
+        "cross_checks":      cross_check_count,
+        "trust":             new_trust,
+    })
+
+
 @app.route("/api/events", methods=["DELETE"])
 def clear_events():
     with event_lock:
